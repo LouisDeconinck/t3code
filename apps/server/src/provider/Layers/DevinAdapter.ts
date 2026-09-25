@@ -632,13 +632,22 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
                       decision: resolved,
                     }),
                   );
+                  const optionKind =
+                    resolved === "acceptForSession"
+                      ? "allow_always"
+                      : resolved === "accept"
+                        ? "allow_once"
+                        : "reject_once";
+                  const offeredOptionId = params.options.find(
+                    (option) => option.kind === optionKind,
+                  )?.optionId;
                   return {
                     outcome:
                       resolved === "cancel"
                         ? ({ outcome: "cancelled" } as const)
                         : {
                             outcome: "selected" as const,
-                            optionId: acpPermissionOutcome(resolved),
+                            optionId: offeredOptionId ?? acpPermissionOutcome(resolved),
                           },
                   };
                 }),

@@ -626,6 +626,25 @@ const program = Effect.gen(function* () {
           },
         );
       }
+      if (
+        devinProfile &&
+        request.configId === "model" &&
+        typeof request.value === "string" &&
+        ![
+          "adaptive",
+          "swe-2-high",
+          "swe-2-max",
+          "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+        ].includes(request.value)
+      ) {
+        return yield* AcpError.AcpRequestError.invalidParams(
+          `Mock Devin rejected model ${request.value}.`,
+          {
+            method: "session/set_config_option",
+            params: request,
+          },
+        );
+      }
       if (request.configId === "mode" && typeof request.value === "string") {
         currentModeId = request.value;
       }
@@ -647,25 +666,6 @@ const program = Effect.gen(function* () {
         typeof request.value === "string"
       ) {
         currentReasoning = request.value;
-      }
-      if (
-        devinProfile &&
-        request.configId === "model" &&
-        typeof request.value === "string" &&
-        ![
-          "adaptive",
-          "swe-2-high",
-          "swe-2-max",
-          "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
-        ].includes(request.value)
-      ) {
-        return yield* AcpError.AcpRequestError.invalidParams(
-          `Mock Devin rejected model ${request.value}.`,
-          {
-            method: "session/set_config_option",
-            params: request,
-          },
-        );
       }
       return {
         configOptions: configOptions(),
