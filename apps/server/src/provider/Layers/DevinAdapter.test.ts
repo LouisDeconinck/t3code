@@ -389,6 +389,45 @@ it.layer(devinAdapterTestLayer)("DevinAdapterLive", (it) => {
     }),
   );
 
+  it.effect("settles a started turn as failed when the prompt dies", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("devin-failed-turn");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockDevinWrapper({ T3_ACP_FAIL_PROMPT: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<ProviderRuntimeEvent>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          runtimeEvents.push(event);
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(turnCompleted, event);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const error = yield* adapter.sendTurn({ threadId, input: "run it" }).pipe(Effect.flip);
+      assert.match(String(error._tag), /^ProviderAdapter/);
+
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeout("5 seconds"));
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      assert.isTrue(runtimeEvents.some((event) => event.type === "turn.started"));
+      if (completed.type === "turn.completed") {
+        assert.equal(completed.payload.state, "failed");
+      } else {
+        assert.fail(`expected turn.completed, got ${completed.type}`);
+      }
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
   it.effect("resumes a session from the persisted cursor", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("devin-resume");

@@ -1526,6 +1526,10 @@ const program = Effect.gen(function* () {
       });
     }
 
+    if (method === "session/delete") {
+      return Effect.succeed({});
+    }
+
     if (method !== "session/mode/set") {
       return Effect.fail(AcpError.AcpRequestError.methodNotFound(method));
     }

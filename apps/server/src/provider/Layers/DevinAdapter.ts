@@ -27,6 +27,7 @@ import {
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -840,6 +841,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
         // resolving from here on does not settle the turn; the matching
         // decrement is the `ensuring` below.
         ctx.promptsInFlight += 1;
+        let turnStartedPublished = false;
 
         return yield* Effect.gen(function* () {
           const turnModelSelection =
@@ -879,6 +881,7 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
               turnId,
               payload: { model: resolvedModel },
             });
+            turnStartedPublished = true;
           }
 
           const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
@@ -992,6 +995,32 @@ export function makeDevinAdapter(devinSettings: DevinSettings, options?: DevinAd
             Effect.sync(() => {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
             }),
+          ),
+          // A prompt that dies after its turn was announced — or a steer that
+          // fails after the superseded prompt already skipped completion —
+          // must still settle the merged turn, or the thread reads as running
+          // forever.
+          Effect.onError((cause) =>
+            Effect.ignore(
+              Effect.gen(function* () {
+                const announced = steeringTurnId !== undefined || turnStartedPublished;
+                if (!announced || ctx.promptsInFlight !== 0) {
+                  return;
+                }
+                yield* offerRuntimeEvent({
+                  type: "turn.completed",
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId,
+                  payload: {
+                    state: "failed",
+                    stopReason: null,
+                    errorMessage: Cause.pretty(cause).trim(),
+                  },
+                });
+              }),
+            ),
           ),
         );
       });

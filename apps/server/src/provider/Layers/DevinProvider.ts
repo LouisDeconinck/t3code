@@ -362,8 +362,9 @@ export const discoverDevinModelsViaAcp = (
         const started = yield* acp.start();
         const models = buildDevinDiscoveredModels(yield* acp.getConfigOptions);
         // Probing opens a real Devin session; delete it so health checks do
-        // not accumulate empty sessions in `devin list`.
-        yield* Effect.ignore(acp.request("session/delete", { sessionId: started.sessionId }));
+        // not accumulate empty sessions in `devin list`. A delete failure is
+        // surfaced through the health check instead of silently piling up.
+        yield* acp.request("session/delete", { sessionId: started.sessionId });
         return models;
       }),
     environment,
