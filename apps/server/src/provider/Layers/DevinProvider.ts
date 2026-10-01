@@ -156,5 +156,14 @@ export const checkDevinProviderStatus = Effect.fn("checkDevinProviderStatus")(fu
       message: "Devin CLI is not logged in. Run `devin auth login`.",
     });
   }
+  if (auth.status !== "authenticated" || authOutput?.code !== 0) {
+    return build({
+      installed: true,
+      version,
+      status: "warning",
+      auth: { status: "unknown" },
+      message: "Could not verify the Devin CLI login. Run `devin auth status` to check it.",
+    });
+  }
   return build({ installed: true, version, status: "ready", auth });
 });

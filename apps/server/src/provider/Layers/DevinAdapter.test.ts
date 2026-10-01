@@ -168,6 +168,61 @@ it.layer(devinAdapterTestLayer)("DevinAdapter", (it) => {
     }),
   );
 
+  it.effect("folds a send that arrives while a turn is starting into that turn", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("devin-concurrent-send");
+      const binaryPath = yield* Effect.promise(() => makeMockDevin({}));
+      const adapter = yield* makeDevinAdapter(decodeDevinSettings({ binaryPath })).pipe(
+        Effect.orDie,
+      );
+      const events: ProviderRuntimeEvent[] = [];
+      const turnCompleted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)).pipe(
+          Effect.andThen(
+            event.type === "turn.completed"
+              ? Deferred.succeed(turnCompleted, undefined)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("devin"), model: "composer-2" },
+      });
+      // The first send switches models, so it is still waiting on ACP when the second arrives.
+      const [first, second] = yield* Effect.all(
+        [
+          adapter.sendTurn({
+            threadId,
+            input: "first",
+            attachments: [],
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("devin"),
+              model: "composer-2[fast=true]",
+            },
+          }),
+          adapter.sendTurn({ threadId, input: "second", attachments: [] }),
+        ],
+        { concurrency: "unbounded" },
+      );
+      yield* Deferred.await(turnCompleted);
+      yield* Fiber.interrupt(eventsFiber);
+
+      assert.equal(second.turnId, first.turnId);
+      assert.equal(events.filter((event) => event.type === "turn.started").length, 1);
+      assert.equal(events.filter((event) => event.type === "turn.completed").length, 1);
+      const [session] = yield* adapter.listSessions();
+      assert.isUndefined(session?.activeTurnId);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("answers approvals with the option id Devin offered", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("devin-approval-thread");

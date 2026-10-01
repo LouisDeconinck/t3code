@@ -79,8 +79,9 @@ interface DevinSessionContext {
 }
 
 /**
- * Devin's ACP session modes. None asks before workspace edits, so supervised
- * threads use `accept-edits`, which still asks before commands.
+ * Devin's ACP session modes. `devin acp` does not offer the CLI's Normal mode
+ * (`ask` is read-only), so supervised threads use `accept-edits`, which still
+ * asks before commands.
  */
 export function devinModeId(runtimeMode: RuntimeMode): string {
   switch (runtimeMode) {
@@ -514,9 +515,12 @@ export function makeDevinAdapter(settings: DevinSettings, options?: DevinAdapter
             issue: "Turn requires non-empty text or attachments.",
           });
         }
+        const freshTurnId = TurnId.make(yield* randomId);
+        // Reserve the turn before any async work so a concurrent send steers this turn.
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-        const turnId = steeringTurnId ?? TurnId.make(yield* randomId);
+        const turnId = steeringTurnId ?? freshTurnId;
         ctx.promptsInFlight += 1;
+        ctx.activeTurnId = turnId;
 
         return yield* Effect.gen(function* () {
           const model =
@@ -530,7 +534,6 @@ export function makeDevinAdapter(settings: DevinSettings, options?: DevinAdapter
             promptParts.push(yield* readImageAttachment(image));
           }
 
-          ctx.activeTurnId = turnId;
           ctx.session = { ...ctx.session, model, activeTurnId: turnId, updatedAt: yield* nowIso };
           if (steeringTurnId === undefined) {
             yield* offerRuntimeEvent({
@@ -585,6 +588,11 @@ export function makeDevinAdapter(settings: DevinSettings, options?: DevinAdapter
           Effect.ensuring(
             Effect.sync(() => {
               ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
+              if (ctx.promptsInFlight === 0 && ctx.activeTurnId === turnId) {
+                ctx.activeTurnId = undefined;
+                const { activeTurnId: _settled, ...session } = ctx.session;
+                ctx.session = session;
+              }
             }),
           ),
         );

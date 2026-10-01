@@ -18,7 +18,7 @@ describe("parseDevinAuthStatus", () => {
   });
 });
 
-const fakeDevin = (authStatusOutput: string) =>
+const fakeDevin = (authStatusOutput: string, authStatusExitCode = 0) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-devin-status-" });
@@ -29,7 +29,7 @@ const fakeDevin = (authStatusOutput: string) =>
         "const args = process.argv.slice(2).join(' ');",
         "if (args === 'version') process.stdout.write('devin 3000.11.3 (9c803229faa4)\\n');",
         // @effect-diagnostics-next-line preferSchemaOverJson:off
-        `else if (args === 'auth status') process.stdout.write(${JSON.stringify(authStatusOutput)});`,
+        `else if (args === 'auth status') { process.stdout.write(${JSON.stringify(authStatusOutput)}); process.exit(${authStatusExitCode}); }`,
         "else process.exit(2);",
         "",
       ].join("\n"),
@@ -66,6 +66,25 @@ it.layer(NodeServices.layer)("checkDevinProviderStatus", (it) => {
       }),
     ),
   );
+
+  for (const [label, output, exitCode] of [
+    ["fails", "Logged in (via Devin).\n", 1],
+    ["prints unrecognized output", "auth service unavailable\n", 0],
+  ] as const) {
+    it.effect(`warns instead of reporting ready when the login check ${label}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const binaryPath = yield* fakeDevin(output, exitCode);
+          const snapshot = yield* checkDevinProviderStatus(
+            decodeDevinSettings({ enabled: true, binaryPath }),
+          );
+          expect(snapshot.status).toBe("warning");
+          expect(snapshot.auth.status).toBe("unknown");
+          expect(snapshot.message).toContain("devin auth status");
+        }),
+      ),
+    );
+  }
 
   it.effect("reports a missing binary", () =>
     Effect.gen(function* () {
