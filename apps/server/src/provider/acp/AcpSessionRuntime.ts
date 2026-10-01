@@ -95,12 +95,7 @@ export interface AcpSessionRuntimeOptions {
     readonly name: string;
     readonly version: string;
   };
-  /**
-   * ACP `authenticate` method invoked between `initialize` and session setup.
-   * Omit it for providers that authenticate through credentials the CLI
-   * already manages (for example Devin's `devin auth login` store), where no
-   * ACP auth round trip exists.
-   */
+  /** Omit for agents that read stored CLI credentials; `authenticate` is then never sent. */
   readonly authMethodId?: string;
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   /** Extra workspace roots the agent may read and write besides `cwd`. */
@@ -228,9 +223,8 @@ export class AcpSessionRuntime extends Context.Service<
       EffectAcpErrors.AcpError
     >;
     /**
-     * Initializes the ACP connection, authenticates when `authMethodId` is
-     * configured, and loads, resumes, or creates the session. Concurrent calls
-     * share the same in-flight startup and a failed startup may be retried.
+     * Initializes the ACP connection, authenticates, and loads, resumes, or creates the session.
+     * Concurrent calls share the same in-flight startup and a failed startup may be retried.
      */
     readonly start: () => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
     /** Stream of parsed root-session events and connection failures. */

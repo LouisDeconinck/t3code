@@ -21,8 +21,12 @@ not prevent the agent from asking questions about the task.
 ## Provider differences
 
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
-**Auto** uses automatic review on Codex, Claude, and Cursor, and maps to Devin's Smart mode;
-providers without an equivalent, including OpenCode and Antigravity, fall back to asking.
+**Auto** uses automatic review on Codex, Claude, and Cursor; providers without an equivalent,
+including OpenCode and Antigravity, fall back to asking.
+
+Devin has no mode that asks before file edits, so **Supervised** behaves like **Auto-accept
+edits**. **Auto** uses Devin's Smart mode. **Always allow this session** uses Devin's
+session-scoped approval when it offers one; otherwise it approves only the current request.
 
 For Grok, **Always allow this session** remembers the matching command or tool input. Other
 actions still require approval.

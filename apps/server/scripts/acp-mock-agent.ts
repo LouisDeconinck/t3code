@@ -15,7 +15,6 @@ import type * as AcpSchema from "effect-acp/schema";
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const exitLogPath = process.env.T3_ACP_EXIT_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
-const devinProfile = process.env.T3_ACP_DEVIN === "1";
 const emitToolCalls = process.env.T3_ACP_EMIT_TOOL_CALLS === "1";
 const emitInterleavedAssistantToolCalls =
   process.env.T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS === "1";
@@ -72,9 +71,8 @@ const permissionRequestCount = Math.max(
 );
 const sessionId = "mock-session-1";
 
-const devinInitialMode = process.env.T3_ACP_DEVIN_INITIAL_MODE?.trim() || "accept-edits";
-let currentModeId = antigravityProfile ? "default" : devinProfile ? devinInitialMode : "ask";
-let currentModelId = antigravityProfile ? "gemini-test-low" : devinProfile ? "adaptive" : "default";
+let currentModeId = antigravityProfile ? "default" : "ask";
+let currentModelId = antigravityProfile ? "gemini-test-low" : "default";
 let parameterizedModelPicker = false;
 let currentReasoning = "medium";
 let currentContext = "272k";
@@ -120,53 +118,6 @@ process.once("exit", (code) => {
 });
 
 function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
-  if (devinProfile) {
-    // Mirrors the real `devin acp` session surface: model, mode, and
-    // thought_level are all session config options; there is no
-    // session/set_model.
-    return [
-      {
-        id: "model",
-        name: "Model",
-        category: "model",
-        type: "select",
-        currentValue: currentModelId,
-        options: [
-          { value: "adaptive", name: "Adaptive" },
-          { value: "swe-2-high", name: "SWE-2" },
-          {
-            value: "swe-2-max",
-            name: "SWE-2 Max",
-            _meta: { "cognition.ai/supportsImages": true },
-          },
-          {
-            value: "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
-            name: "Fusion (Claude Fable 5.1 Medium + SWE-2 Medium)",
-          },
-        ],
-      },
-      {
-        id: "mode",
-        name: "Mode",
-        category: "mode",
-        type: "select",
-        currentValue: currentModeId,
-        options: devinModes.map((mode) => ({ value: mode.id, name: mode.name })),
-      },
-      {
-        id: "thought_level",
-        name: "Thought level",
-        category: "thought_level",
-        type: "select",
-        currentValue: currentReasoning,
-        options: [
-          { value: "medium", name: "Medium" },
-          { value: "high", name: "High" },
-          { value: "max", name: "Max" },
-        ],
-      },
-    ];
-  }
   if (antigravityProfile) {
     return [
       {
@@ -351,39 +302,29 @@ const antigravityModels = [
   { modelId: "gemini-test-high", name: "Gemini Test High" },
 ] satisfies ReadonlyArray<AcpSchema.ModelInfo>;
 
-const devinModes: ReadonlyArray<AcpSchema.SessionMode> = [
-  { id: "accept-edits", name: "Accept edits" },
-  { id: "smart", name: "Smart" },
-  { id: "ask", name: "Ask" },
-  { id: "plan", name: "Plan" },
-  { id: "bypass", name: "Bypass permissions" },
-];
-
 const availableModes: ReadonlyArray<AcpSchema.SessionMode> = antigravityProfile
   ? [
       { id: "default", name: "Default" },
       { id: "auto_edit", name: "Auto edit" },
       { id: "yolo", name: "YOLO" },
     ]
-  : devinProfile
-    ? devinModes
-    : [
-        {
-          id: "ask",
-          name: "Ask",
-          description: "Request permission before making any changes",
-        },
-        {
-          id: "architect",
-          name: "Architect",
-          description: "Design and plan software systems without implementation",
-        },
-        {
-          id: "code",
-          name: "Code",
-          description: "Write and modify code with full tool access",
-        },
-      ];
+  : [
+      {
+        id: "ask",
+        name: "Ask",
+        description: "Request permission before making any changes",
+      },
+      {
+        id: "architect",
+        name: "Architect",
+        description: "Design and plan software systems without implementation",
+      },
+      {
+        id: "code",
+        name: "Code",
+        description: "Write and modify code with full tool access",
+      },
+    ];
 
 function modeState(): AcpSchema.SessionModeState {
   return {
@@ -626,25 +567,6 @@ const program = Effect.gen(function* () {
           },
         );
       }
-      if (
-        devinProfile &&
-        request.configId === "model" &&
-        typeof request.value === "string" &&
-        ![
-          "adaptive",
-          "swe-2-high",
-          "swe-2-max",
-          "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
-        ].includes(request.value)
-      ) {
-        return yield* AcpError.AcpRequestError.invalidParams(
-          `Mock Devin rejected model ${request.value}.`,
-          {
-            method: "session/set_config_option",
-            params: request,
-          },
-        );
-      }
       if (request.configId === "mode" && typeof request.value === "string") {
         currentModeId = request.value;
       }
@@ -659,13 +581,6 @@ const program = Effect.gen(function* () {
       }
       if (request.configId === "fast") {
         currentFast = request.value === true || request.value === "true";
-      }
-      if (
-        devinProfile &&
-        request.configId === "thought_level" &&
-        typeof request.value === "string"
-      ) {
-        currentReasoning = request.value;
       }
       return {
         configOptions: configOptions(),
@@ -706,6 +621,12 @@ const program = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedSessionId = String(request.sessionId ?? sessionId);
       promptCount += 1;
+      if (
+        process.env.T3_ACP_CRASH_PROMPT === "1" &&
+        request.prompt.some((part) => part.type === "text" && part.text === "crash now")
+      ) {
+        return yield* Effect.sync(() => process.exit(23));
+      }
 
       if (completeFirstPromptOnCancel && promptCount === 1) {
         yield* agent.client.sessionUpdate({
@@ -1524,10 +1445,6 @@ const program = Effect.gen(function* () {
       return Effect.succeed({
         models: availableModels(),
       });
-    }
-
-    if (method === "session/delete") {
-      return Effect.succeed({});
     }
 
     if (method !== "session/mode/set") {

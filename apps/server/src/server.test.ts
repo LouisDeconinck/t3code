@@ -123,7 +123,10 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
-import { OrchestrationThreadSettleBlockedError } from "./orchestration/Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationThreadSettleBlockedError,
+} from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
@@ -140,6 +143,7 @@ import {
   AntigravityInstallation,
   AntigravityInstallationError,
 } from "./provider/AntigravityInstallation.ts";
+import { CodexInstallation } from "./provider/CodexInstallation.ts";
 import type { ProviderInstance } from "./provider/ProviderDriver.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import { ProviderAdapterRequestError } from "./provider/Errors.ts";
@@ -176,10 +180,12 @@ import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
+import { REPLAY_MARKER_MAX_AGE } from "./auth/replayMarkers.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
+import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as HostResources from "./resourceTelemetry/HostResources.ts";
@@ -489,7 +495,7 @@ const makeBrowserOtlpPayload = (spanName: string) =>
         url: collector.url,
         exportInterval: "10 millis",
         resource: {
-          serviceName: "t3-web",
+          serviceName: "t3code-web",
           attributes: {
             "service.runtime": "t3-web",
             "service.mode": "browser",
@@ -527,6 +533,7 @@ const buildAppUnderTest = (options?: {
     providerAuth?: Partial<ProviderAuthService["Service"]>;
     providerInstanceRegistry?: Partial<ProviderInstanceRegistry["Service"]>;
     antigravityInstallation?: Partial<AntigravityInstallation["Service"]>;
+    codexInstallation?: Partial<CodexInstallation["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
@@ -561,6 +568,7 @@ const buildAppUnderTest = (options?: {
       CloudManagedEndpointRuntime.CloudManagedEndpointRuntime["Service"]
     >;
     relayClient?: Partial<RelayClient.RelayClient["Service"]>;
+    agentAwarenessRelay?: Partial<AgentAwarenessRelay.AgentAwarenessRelay["Service"]>;
     cloudCliTokenManager?: Partial<CloudCliTokenManager.CloudCliTokenManager["Service"]>;
     httpClient?: HttpClient.HttpClient;
     nativeTelemetryClient?: Partial<NativeTelemetryClient.NativeTelemetryClient["Service"]>;
@@ -588,7 +596,6 @@ const buildAppUnderTest = (options?: {
       otlpTracesExport: DEFAULT_SIGNAL_EXPORT,
       otlpMetricsExport: DEFAULT_SIGNAL_EXPORT,
       otlpLogsExport: DEFAULT_SIGNAL_EXPORT,
-      otlpServiceName: "t3-server",
       otelEnvironment: OtelEnvironment.none,
       mode: "desktop",
       port: 0,
@@ -825,6 +832,10 @@ const buildAppUnderTest = (options?: {
             getInstance: () => Effect.undefined,
             listInstances: Effect.succeed([]),
             ...options?.layers?.providerInstanceRegistry,
+          }),
+          Layer.mock(CodexInstallation)({
+            managedDirectory: "unused-test-codex-runtime",
+            ...options?.layers?.codexInstallation,
           }),
           Layer.mock(AntigravityInstallation)({
             managedDirectory: "unused-test-antigravity-runtime",
@@ -1173,14 +1184,20 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide(
-        Layer.succeed(
-          CloudManagedEndpointRuntime.CloudManagedEndpointRuntime,
-          CloudManagedEndpointRuntime.CloudManagedEndpointRuntime.of({
-            applyConfig: () => Effect.succeed({ status: "disabled" }),
-            recoveryRequests: Stream.empty,
-            requestRecovery: () => Effect.void,
-            withLinkStateLock: (effect) => effect,
-            ...options?.layers?.cloudManagedEndpointRuntime,
+        Layer.mergeAll(
+          Layer.succeed(
+            CloudManagedEndpointRuntime.CloudManagedEndpointRuntime,
+            CloudManagedEndpointRuntime.CloudManagedEndpointRuntime.of({
+              applyConfig: () => Effect.succeed({ status: "disabled" }),
+              recoveryRequests: Stream.empty,
+              requestRecovery: () => Effect.void,
+              withLinkStateLock: (effect) => effect,
+              ...options?.layers?.cloudManagedEndpointRuntime,
+            }),
+          ),
+          Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({
+            requestCatchUp: () => Effect.void,
+            ...options?.layers?.agentAwarenessRelay,
           }),
         ),
       ),
@@ -2644,6 +2661,40 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("rejects a DPoP replay by time alone once its marker can be pruned", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const credentialResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: ownerCookie },
+        body: yield* HttpBody.json({}),
+      });
+      const credential = (yield* credentialResponse.json) as { readonly credential: string };
+      const tokenUrl = yield* getHttpServerUrl("/oauth/token");
+      const acceptedAt = yield* DateTime.now;
+      // The longest-lived proof: `iat` at the 5 s future skew the verifier allows.
+      const dpop = makeDpopProof({
+        method: "POST",
+        url: tokenUrl,
+        iat: Math.floor(acceptedAt.epochMilliseconds / 1_000) + 5,
+      });
+      const exchange = exchangeAccessToken(credential.credential, {
+        headers: { dpop: dpop.proof },
+        scope: "orchestration:read orchestration:operate terminal:operate review:write",
+      });
+
+      assert.equal((yield* exchange).response.status, 200);
+      // While the proof is fresh, only the replay marker rejects it.
+      assert.equal((yield* exchange).body.dpopFailureReason, "replay");
+      // Once the marker can be pruned, the time check rejects the proof by itself.
+      yield* TestClock.setTime(
+        acceptedAt.epochMilliseconds + Duration.toMillis(REPLAY_MARKER_MAX_AGE),
+      );
+      assert.equal((yield* exchange).body.dpopFailureReason, "time_window");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("ignores forwarded host headers when validating token exchange DPoP URLs", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
@@ -3077,6 +3128,55 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(pairedResponse.status, 403);
       assert.equal(pairedBody._tag, "EnvironmentScopeRequiredError");
       assert.equal(pairedBody.requiredScope, "relay:write");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("wakes the agent awareness relay when this server links or changes publishing", () =>
+    Effect.gen(function* () {
+      let catchUpRequests = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          agentAwarenessRelay: {
+            requestCatchUp: () =>
+              Effect.sync(() => {
+                catchUpRequests += 1;
+              }),
+          },
+        },
+      });
+
+      const cloudKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+        privateKeyEncoding: { format: "pem", type: "pkcs8" },
+        publicKeyEncoding: { format: "pem", type: "spki" },
+      });
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const relayConfigResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/connect/relay-config"),
+        {
+          method: "POST",
+          headers: { cookie: ownerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({
+            relayUrl: "https://relay.example.test",
+            cloudUserId: "user_123",
+            environmentCredential: "t3env_test_credential",
+            cloudMintPublicKey: cloudKeyPair.publicKey,
+            endpointRuntime: null,
+          }),
+        },
+      );
+      assert.equal(relayConfigResponse.status, 200);
+      assert.equal(catchUpRequests, 1);
+
+      const preferencesResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/connect/preferences"),
+        {
+          method: "POST",
+          headers: { cookie: ownerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({ publishAgentActivity: true }),
+        },
+      );
+      assert.equal(preferencesResponse.status, 200);
+      assert.equal(catchUpRequests, 2);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -3708,6 +3808,82 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(replayResponse.status, 409);
       assert.equal(replayBody._tag, "EnvironmentHttpConflictError");
       assert.equal(replayBody.message, "Cloud health request was already consumed.");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects cloud replays by time alone once their markers can be pruned", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const cloudKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+        privateKeyEncoding: { format: "pem", type: "pkcs8" },
+        publicKeyEncoding: { format: "pem", type: "spki" },
+      });
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const relayConfigResponse = yield* fetchEffect(
+        yield* getHttpServerUrl("/api/connect/relay-config"),
+        {
+          method: "POST",
+          headers: { cookie: ownerCookie, "content-type": "application/json" },
+          body: jsonRequestBody({
+            relayUrl: "https://relay.example.test",
+            cloudUserId: "user_123",
+            environmentCredential: "t3env_test_credential",
+            cloudMintPublicKey: cloudKeyPair.publicKey,
+            endpointRuntime: null,
+          }),
+        },
+      );
+      assert.equal(relayConfigResponse.status, 200);
+
+      const acceptedAt = yield* DateTime.now;
+      // The longest-lived proofs: `iat` at the 60 s future skew the handlers
+      // allow, and the 5 minute maximum lifetime.
+      const issuedAt = DateTime.add(acceptedAt, { minutes: 1 });
+      const proofTimes = {
+        issuedAt: DateTime.formatIso(issuedAt),
+        expiresAt: DateTime.formatIso(DateTime.add(issuedAt, { minutes: 5 })),
+      };
+      const requests = [
+        [
+          "/api/t3-connect/health",
+          makeCloudEnvironmentHealthRequest({
+            privateKey: cloudKeyPair.privateKey,
+            environmentId: testEnvironmentDescriptor.environmentId,
+            nonce: "cloud-health-nonce-pruned",
+            ...proofTimes,
+          }),
+        ],
+        [
+          "/api/t3-connect/mint-credential",
+          makeCloudMintCredentialRequest({
+            privateKey: cloudKeyPair.privateKey,
+            environmentId: testEnvironmentDescriptor.environmentId,
+            clientProofKeyThumbprint: "client-proof-key-thumbprint",
+            nonce: "cloud-mint-nonce-pruned",
+            ...proofTimes,
+          }),
+        ],
+      ] as const;
+      const postAll = Effect.forEach(requests, ([pathname, request]) =>
+        Effect.gen(function* () {
+          const response = yield* fetchEffect(yield* getHttpServerUrl(pathname), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: jsonRequestBody(request),
+          });
+          return response.status;
+        }),
+      );
+
+      assert.deepStrictEqual(yield* postAll, [200, 200]);
+      // While the proofs are fresh, only the replay markers reject them (409).
+      assert.deepStrictEqual(yield* postAll, [409, 409]);
+      // Once the markers can be pruned, the time checks reject the proofs by themselves (401).
+      yield* TestClock.setTime(
+        acceptedAt.epochMilliseconds + Duration.toMillis(REPLAY_MARKER_MAX_AGE),
+      );
+      assert.deepStrictEqual(yield* postAll, [401, 401]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -5161,6 +5337,284 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("creates the Scratch project once and restores its folder on reuse", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const created: Array<{ readonly projectId: ProjectId; readonly workspaceRoot: string }> = [];
+      const iconUpdates: Array<unknown> = [];
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                if (command.type === "project.create") {
+                  created.push({
+                    projectId: command.projectId,
+                    workspaceRoot: command.workspaceRoot,
+                  });
+                }
+                if (command.type === "project.meta.update") iconUpdates.push(command.projectIcon);
+                return { sequence: created.length + iconUpdates.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getActiveProjectByWorkspaceRoot: (workspaceRoot) =>
+              Effect.succeed(
+                Option.fromNullishOr(
+                  created.find((project) => project.workspaceRoot === workspaceRoot),
+                ).pipe(
+                  Option.map((project) => ({
+                    ...makeDefaultOrchestrationReadModel().projects[0]!,
+                    id: project.projectId,
+                    workspaceRoot,
+                  })),
+                ),
+              ),
+          },
+        },
+      });
+
+      yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          Effect.gen(function* () {
+            const config = yield* client[WS_METHODS.serverGetConfig]({});
+            const scratchRoot = config.scratchWorkspaceRoot ?? "";
+            const first = yield* client[WS_METHODS.projectsEnsureScratch]({});
+            // A user may delete the folder; reuse must bring it back.
+            yield* fileSystem.remove(scratchRoot, { recursive: true });
+            const second = yield* client[WS_METHODS.projectsEnsureScratch]({});
+
+            assert.isTrue(scratchRoot.endsWith("scratch"));
+            assert.equal(created.length, 1);
+            assert.equal(created[0]?.workspaceRoot, scratchRoot);
+            assert.equal(first.projectId, created[0]?.projectId);
+            assert.equal(second.projectId, first.projectId);
+            // The icon is set once, at create.
+            assert.deepEqual(iconUpdates, [
+              { kind: "lucide", name: "message-square-dashed", color: "gray" },
+            ]);
+            assert.isTrue(yield* fileSystem.exists(scratchRoot));
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("resolves a lost Scratch create race to the winning project", () =>
+    Effect.gen(function* () {
+      const winnerId = ProjectId.make("project-scratch-winner");
+      let lookups = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.fail(
+                new OrchestrationCommandInvariantError({
+                  commandType: command.type,
+                  detail: "Active project already exists for workspace root.",
+                }),
+              ),
+          },
+          projectionSnapshotQuery: {
+            // Empty before the create, then the other client's project.
+            getActiveProjectByWorkspaceRoot: (workspaceRoot) =>
+              Effect.sync(() =>
+                lookups++ === 0
+                  ? Option.none()
+                  : Option.some({
+                      ...makeDefaultOrchestrationReadModel().projects[0]!,
+                      id: winnerId,
+                      workspaceRoot,
+                    }),
+              ),
+          },
+        },
+      });
+
+      const result = yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          client[WS_METHODS.projectsEnsureScratch]({}),
+        ),
+      );
+      assert.equal(result.projectId, winnerId);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("gives each new Scratch thread its own folder", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const scratchProjectId = ProjectId.make("project-scratch");
+      let scratchRoot = "";
+      const created: Array<string | null> = [];
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                if (command.type === "thread.create") created.push(command.worktreePath);
+                return { sequence: created.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+          projectionSnapshotQuery: {
+            getProjectShellById: (projectId) =>
+              Effect.succeed(
+                projectId === scratchProjectId
+                  ? Option.some({
+                      id: scratchProjectId,
+                      title: "Scratch",
+                      workspaceRoot: scratchRoot,
+                      defaultModelSelection: null,
+                      scripts: [],
+                      createdAt: "2026-09-25T00:00:00.000Z",
+                      updatedAt: "2026-09-25T00:00:00.000Z",
+                    })
+                  : Option.none(),
+              ),
+          },
+        },
+      });
+
+      yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          Effect.gen(function* () {
+            scratchRoot =
+              (yield* client[WS_METHODS.serverGetConfig]({})).scratchWorkspaceRoot ?? "";
+            const createdAt = "2026-09-25T10:00:00.000Z";
+            // The second id shares the first's short prefix, the third tries to
+            // climb out of the scratch root, and the fourth pastes a long token.
+            const text = "Convert these PNGs to WebP, please!";
+            const starts = [
+              { id: "a1b2c3d4-scratch-thread", text },
+              { id: "a1b2c3d4-other", text },
+              { id: "../../escape", text },
+              { id: "f00dcafe-long", text: "x".repeat(300) },
+            ];
+            for (const [index, { id, text: messageText }] of starts.entries()) {
+              yield* client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                type: "thread.turn.start",
+                commandId: CommandId.make(`cmd-scratch-turn-start-${index}`),
+                threadId: ThreadId.make(id),
+                message: {
+                  messageId: MessageId.make(`msg-scratch-${index}`),
+                  role: "user",
+                  text: messageText,
+                  attachments: [],
+                },
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                bootstrap: {
+                  createThread: {
+                    projectId: scratchProjectId,
+                    title: "New thread",
+                    modelSelection: defaultModelSelection,
+                    runtimeMode: "full-access",
+                    interactionMode: "default",
+                    branch: null,
+                    worktreePath: null,
+                    createdAt,
+                  },
+                },
+                createdAt,
+              });
+            }
+          }),
+        ),
+      );
+
+      // The date is the server's receipt time, not the client's createdAt.
+      const names = created.map((folder) => path.basename(folder ?? ""));
+      assert.match(names[0] ?? "", /^\d{4}-\d{2}-\d{2}-convert-these-pngs-to-webp-a1b2c3d4$/);
+      assert.match(names[1] ?? "", /-convert-these-pngs-to-webp-a1b2c3d4other$/);
+      assert.match(names[2] ?? "", /-convert-these-pngs-to-webp-escape$/);
+      assert.match(names[3] ?? "", /^\d{4}-\d{2}-\d{2}-x{48}-f00dcafe$/);
+      for (const folder of created) {
+        assert.equal(path.dirname(folder ?? ""), scratchRoot);
+        assert.isTrue(yield* fileSystem.exists(folder ?? ""));
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("withholds Scratch when the data dir sits inside a work tree", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: { vcsDriver: { isInsideWorkTree: () => Effect.succeed(true) } },
+      });
+      yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          Effect.gen(function* () {
+            const config = yield* client[WS_METHODS.serverGetConfig]({});
+            const ensure = yield* Effect.flip(client[WS_METHODS.projectsEnsureScratch]({}));
+
+            assert.isUndefined(config.scratchWorkspaceRoot);
+            assert.include(String(ensure.message), "not available");
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("creates a project from just a name in the projects folder", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const created: Array<{ readonly title: string; readonly workspaceRoot: string }> = [];
+      const gitCalls: Array<string> = [];
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                if (command.type === "project.create") {
+                  created.push({ title: command.title, workspaceRoot: command.workspaceRoot });
+                }
+                return { sequence: created.length };
+              }),
+          },
+          gitVcsDriver: {
+            readConfigValue: () => Effect.succeed(null),
+            execute: (input) =>
+              Effect.sync(() => {
+                gitCalls.push(input.args.join(" "));
+                return {
+                  exitCode: ChildProcessSpawner.ExitCode(0),
+                  stdout: "",
+                  stderr: "",
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                };
+              }),
+          },
+        },
+      });
+
+      yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          Effect.gen(function* () {
+            const root = (yield* client[WS_METHODS.serverGetConfig]({})).newProjectsRoot ?? "";
+            const result = yield* client[WS_METHODS.projectsCreateNew]({ name: "Pinball Stats" });
+
+            assert.equal(result.workspaceRoot, path.join(root, "pinball-stats"));
+            assert.isUndefined(result.commitError);
+            assert.deepEqual(created, [
+              { title: "Pinball Stats", workspaceRoot: result.workspaceRoot },
+            ]);
+            assert.deepEqual(gitCalls, [
+              "init --initial-branch=main",
+              "add --force -- README.md assets/icon.svg",
+              "commit --message Initial commit",
+            ]);
+            assert.isTrue(
+              yield* fileSystem.exists(path.join(result.workspaceRoot, "assets", "icon.svg")),
+            );
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("advertises the usable file manager and its reveal label", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({
@@ -5283,7 +5737,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               attributes: [
                 {
                   key: "service.name",
-                  value: { stringValue: "t3-web" },
+                  value: { stringValue: "t3code-web" },
                 },
               ],
             },
@@ -5425,7 +5879,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             "rpc.method": "server.getSettings",
           },
           resourceAttributes: {
-            "service.name": "t3-web",
+            "service.name": "t3code-web",
           },
           scope: {
             name: "effect",
@@ -5556,7 +6010,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       // the stub's utf8 decode even though the surrounding bytes don't.
       assert.notEqual(forwarded.body[0], "{");
       assert.include(forwarded.body, "client.protobuf.test");
-      assert.include(forwarded.body, "t3-web");
+      assert.include(forwarded.body, "t3code-web");
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -5657,9 +6111,59 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.deepEqual(record.links, []);
         assert.equal(record.scope.name, scopeSpan.scope.name);
         assert.deepEqual(record.scope.attributes, {});
-        assert.equal(record.resourceAttributes["service.name"], "t3-web");
+        assert.equal(record.resourceAttributes["service.name"], "t3code-web");
         assert.equal(record.status?.code, String(span.status.code));
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not trace browser OTLP trace exports on the server", () =>
+    Effect.gen(function* () {
+      const spanNames: Array<string> = [];
+      const forwardedUrls: Array<string> = [];
+      yield* buildAppUnderTest({
+        config: { otlpTracesUrl: "http://collector.test/v1/traces" },
+        layers: {
+          httpClient: HttpClient.make((request) =>
+            Effect.sync(() => {
+              forwardedUrls.push(request.url);
+              return HttpClientResponse.fromWeb(request, new Response(null, { status: 204 }));
+            }),
+          ),
+        },
+      }).pipe(
+        Effect.provideService(
+          Tracer.Tracer,
+          Tracer.make({
+            span: (options) => {
+              spanNames.push(options.name);
+              return new Tracer.NativeSpan(options);
+            },
+          }),
+        ),
+      );
+      const cookie = yield* getAuthenticatedSessionCookieHeader();
+      spanNames.length = 0;
+
+      // The query string must not bring back the HTTP server span.
+      for (const url of ["/api/observability/v1/traces", "/api/observability/v1/traces?x=1"]) {
+        const response = yield* HttpClient.post(url, {
+          headers: { cookie, "content-type": "application/json" },
+          body: yield* HttpBody.json({ resourceSpans: [] }),
+        });
+        assert.equal(response.status, 204);
+      }
+
+      assert.deepEqual(forwardedUrls, [
+        "http://collector.test/v1/traces",
+        "http://collector.test/v1/traces",
+      ]);
+      assert.deepEqual(spanNames, []);
+
+      // Other routes keep their HTTP server span.
+      const session = yield* HttpClient.get("/api/auth/session", { headers: { cookie } });
+      assert.equal(session.status, 200);
+      assert.include(spanNames, "http.server GET");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("routes websocket rpc server.upsertKeybinding", () =>

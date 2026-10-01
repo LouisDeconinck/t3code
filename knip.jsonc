@@ -25,6 +25,7 @@
         "scripts/cli.ts",
         "scripts/evaluate-thread-titles.ts",
         "scripts/measure-pr-preview.ts",
+        "scripts/update-test-shard-weights.ts",
         "src/provider/testFixtures/*.mjs",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.
@@ -53,6 +54,8 @@
       "ignoreDependencies": ["playwright-core", "electron-builder"],
     },
     "apps/web": {
+      // Vitest loads this through the per-file @vitest-environment directive.
+      "ignoreDependencies": ["jsdom"],
       // Worktree setup (scripts/setup-worktree.ts) runs this directly.
       "entry": ["scripts/warm-dep-cache.ts"],
       // UI component modules are copied and adapted as cohesive sets. Keep their

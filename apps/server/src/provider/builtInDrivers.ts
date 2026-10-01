@@ -38,10 +38,10 @@ export type BuiltInDriversEnv =
   | ClaudeDriverEnv
   | CodexDriverEnv
   | CursorDriverEnv
-  | DevinDriverEnv
   | GrokDriverEnv
   | OpenCodeDriverEnv
-  | AntigravityDriverEnv;
+  | AntigravityDriverEnv
+  | DevinDriverEnv;
 
 /**
  * Ordered list of built-in drivers. Order matters only for tie-breaking in
