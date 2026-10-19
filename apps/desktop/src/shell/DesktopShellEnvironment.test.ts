@@ -158,6 +158,7 @@ describe("DesktopShellEnvironment", () => {
           userShell: "/usr/local/bin/fish",
           handler: (command) => {
             if (command._tag !== "StandardCommand") return "";
+            assert.deepEqual(command.args.slice(0, -1), ["-lc"]);
             commands.push(command.command);
             return envOutput({ PATH: "/home/test/.local/bin:/usr/bin" });
           },
@@ -213,69 +214,13 @@ describe("DesktopShellEnvironment", () => {
       });
 
       assert.equal(commands.length, 1);
-      assert.equal(commands[0]?._tag === "StandardCommand" ? commands[0].command : "", "/bin/zsh");
+      const probe = commands[0];
+      assert(probe?._tag === "StandardCommand");
+      assert.equal(probe.command, "/bin/zsh");
+      assert.deepEqual(probe.args.slice(0, -1), ["+m", "-ilc"]);
       assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin:/Users/test/.local/bin");
       assert.equal(env.SSH_AUTH_SOCK, "/tmp/secretive.sock");
       assert.equal(env.HOMEBREW_PREFIX, "/opt/homebrew");
-    }),
-  );
-
-  it.effect("probes zsh interactively with job control disabled", () =>
-    Effect.gen(function* () {
-      const env: NodeJS.ProcessEnv = {
-        SHELL: "/bin/zsh",
-        PATH: "/usr/bin",
-      };
-      const commands: ChildProcess.Command[] = [];
-
-      yield* runShellEnvironment({
-        env,
-        platform: "darwin",
-        handler: (command) => {
-          commands.push(command);
-          return envOutput({ PATH: "/opt/homebrew/bin:/usr/bin" });
-        },
-      });
-
-      const probe = commands[0];
-      assert.equal(probe?._tag, "StandardCommand");
-      if (probe?._tag === "StandardCommand") {
-        // `+m` clears MONITOR before zsh startup, so the interactive probe
-        // still reads ~/.zshrc (version-manager PATH lives there) without
-        // tcsetpgrp() on a controlling TTY owned by another process group.
-        assert.deepEqual(probe.args.slice(0, 2), ["+m", "-ilc"]);
-      }
-      assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin");
-    }),
-  );
-
-  it.effect("runs the login-shell probe without interactive job control", () =>
-    Effect.gen(function* () {
-      const env: NodeJS.ProcessEnv = {
-        SHELL: "/bin/bash",
-        PATH: "/usr/bin",
-      };
-      const commands: ChildProcess.Command[] = [];
-
-      yield* runShellEnvironment({
-        env,
-        platform: "darwin",
-        handler: (command) => {
-          commands.push(command);
-          return envOutput({ PATH: "/opt/homebrew/bin:/usr/bin" });
-        },
-      });
-
-      const probe = commands[0];
-      assert.equal(probe?._tag, "StandardCommand");
-      if (probe?._tag === "StandardCommand") {
-        // `-l` without `-i`: interactive job control stops the probe on
-        // SIGTTOU when the session inherits a controlling TTY owned by
-        // another process group. bash reads the same files either way.
-        assert.deepEqual(probe.args.slice(0, 1), ["-lc"]);
-        assert.notInclude(probe.args, "-i");
-      }
-      assert.equal(env.PATH, "/opt/homebrew/bin:/usr/bin");
     }),
   );
 
@@ -464,13 +409,21 @@ describe("DesktopShellEnvironment", () => {
       yield* runShellEnvironment({
         env,
         platform: "linux",
-        handler: () =>
-          envOutput({
+        handler: (command) => {
+          assert(command._tag === "StandardCommand");
+          assert.equal(command.command, "/bin/bash");
+          assert.deepEqual(command.args.slice(0, -1), ["-lc"]);
+          return envOutput({
             PATH: "/home/me/.local/bin:/mise/installs/claude/latest:/mise/shims",
             __MISE_DIFF: "mise-diff",
-          }),
+          });
+        },
       });
 
+      assert.equal(
+        env.PATH,
+        "/home/me/.local/bin:/mise/installs/claude/latest:/mise/shims:/usr/bin",
+      );
       assert.equal(env.__MISE_DIFF, "mise-diff");
     }),
   );

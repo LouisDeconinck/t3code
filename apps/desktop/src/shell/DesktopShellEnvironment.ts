@@ -1,4 +1,8 @@
-import { listLoginShellCandidates, setWindowsPath } from "@t3tools/shared/shell";
+import {
+  listLoginShellCandidates,
+  loginShellProbeArgs,
+  setWindowsPath,
+} from "@t3tools/shared/shell";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -310,16 +314,6 @@ const runCommandOutput = Effect.fn("desktop.shellEnvironment.runCommandOutput")(
   yield* logShellEnvironmentCommandError(error);
   return "";
 });
-
-// zsh only reads ~/.zshrc when interactive, and that file is where version
-// managers and custom bin dirs commonly export PATH, so its probe keeps `-i`
-// but prepends `+m`: clearing MONITOR before startup means the shell never
-// calls tcsetpgrp() on a controlling TTY owned by another process group, which
-// is what stopped `-ilc` probes on SIGTTOU. Other shells keep the plain login
-// probe: bash login shells never read ~/.bashrc, and fish reads config.fish
-// for login shells, so `-i` would only reintroduce the hang.
-const loginShellProbeArgs = (shell: string, command: string): ReadonlyArray<string> =>
-  executableName(shell) === "zsh" ? ["+m", "-ilc", command] : ["-lc", command];
 
 const readLoginShellEnvironment = (
   shell: string,
