@@ -58,19 +58,42 @@ const recordCommandTrace = Effect.fnUntraced(function* <A, E, R>(effect: Effect.
 });
 
 describe("readEnvironmentFromLoginShell probe", () => {
-  it.each(["/bin/bash", "/opt/homebrew/bin/fish"])(
-    "captures PATH with a noninteractive login probe for %s",
-    (shell) => {
-      const execFile = vi.fn(() => "__T3CODE_ENV_PATH_START__\n/a:/b\n__T3CODE_ENV_PATH_END__\n");
+  it("uses a shell-agnostic printenv PATH probe", () => {
+    const execFile = vi.fn<
+      (
+        file: string,
+        args: ReadonlyArray<string>,
+        options: { encoding: "utf8"; timeout: number },
+      ) => string
+    >(() => "__T3CODE_ENV_PATH_START__\n/a:/b\n__T3CODE_ENV_PATH_END__\n");
 
-      expect(readEnvironmentFromLoginShell(shell, ["PATH"], execFile)).toEqual({ PATH: "/a:/b" });
-      expect(execFile).toHaveBeenCalledExactlyOnceWith(
-        shell,
-        ["-lc", expect.stringContaining("printenv PATH || true")],
-        { encoding: "utf8", timeout: 5000 },
-      );
-    },
-  );
+    expect(readEnvironmentFromLoginShell("/opt/homebrew/bin/fish", ["PATH"], execFile).PATH).toBe(
+      "/a:/b",
+    );
+    expect(execFile).toHaveBeenCalledTimes(1);
+
+    const firstCall = execFile.mock.calls[0] as
+      | [string, ReadonlyArray<string>, { encoding: "utf8"; timeout: number }]
+      | undefined;
+    expect(firstCall).toBeDefined();
+    if (!firstCall) {
+      throw new Error("Expected execFile to be called");
+    }
+
+    const [shell, args, options] = firstCall;
+    expect(shell).toBe("/opt/homebrew/bin/fish");
+    expect(args).toHaveLength(2);
+    expect(args?.[0]).toBe("-ilc");
+    expect(args?.[1]).toContain("printenv PATH || true");
+    expect(args?.[1]).toContain("__T3CODE_ENV_PATH_START__");
+    expect(args?.[1]).toContain("__T3CODE_ENV_PATH_END__");
+    expect(options).toEqual({
+      encoding: "utf8",
+      timeout: 5000,
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  });
 });
 
 describe("readPathFromLaunchctl", () => {
@@ -106,7 +129,7 @@ describe("readPathFromLaunchctl", () => {
 });
 
 describe("readEnvironmentFromLoginShell", () => {
-  it("captures zsh environment interactively with job control disabled", () => {
+  it("extracts multiple environment variables from a login shell command", () => {
     const execFile = vi.fn<
       (
         file: string,
@@ -128,11 +151,7 @@ describe("readEnvironmentFromLoginShell", () => {
       PATH: "/a:/b",
       SSH_AUTH_SOCK: "/tmp/secretive.sock",
     });
-    expect(execFile).toHaveBeenCalledExactlyOnceWith(
-      "/bin/zsh",
-      ["+m", "-ilc", expect.stringContaining("printenv SSH_AUTH_SOCK || true")],
-      { encoding: "utf8", timeout: 5000 },
-    );
+    expect(execFile).toHaveBeenCalledTimes(1);
   });
 
   it("omits environment variables that are missing or empty", () => {

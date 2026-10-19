@@ -1,8 +1,4 @@
-import {
-  listLoginShellCandidates,
-  loginShellProbeArgs,
-  setWindowsPath,
-} from "@t3tools/shared/shell";
+import { listLoginShellCandidates, setWindowsPath } from "@t3tools/shared/shell";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -324,7 +320,7 @@ const readLoginShellEnvironment = (
     : runCommandOutput({
         probe: "login-shell",
         command: shell,
-        args: loginShellProbeArgs(shell, capturePosixEnvironmentCommand(names)),
+        args: ["-ilc", capturePosixEnvironmentCommand(names)],
         timeout: LOGIN_SHELL_TIMEOUT,
       }).pipe(Effect.map((output) => extractEnvironment(output, names)));
 
