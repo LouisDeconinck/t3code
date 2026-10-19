@@ -6,8 +6,13 @@ import {
   formatExpiresInLabel,
   formatRelativeTime,
   formatRelativeTimeLabel,
+  formatRelativeTimeUntil,
+  formatRelativeTimeUntilLabel,
   formatShortTimestamp,
-  getRelativeTimeState,
+  formatTimestamp,
+  formatUpcomingTimestamp,
+  msUntilRelativeTimeChange,
+  relativeTimeElapsedMs,
   resolveTimestampLocale,
 } from "./timestampFormat";
 
@@ -23,9 +28,6 @@ describe("resolveTimestampLocale", () => {
   });
 
   it("defers to the runtime default rather than throwing on an unusable tag", () => {
-    // The desktop bridge normalizes POSIX identifiers before reporting them, so
-    // anything Intl still rejects here falls back instead of breaking every
-    // timestamp in the UI.
     expect(resolveTimestampLocale("not a locale")).toBeUndefined();
     expect(resolveTimestampLocale("en_GB")).toBeUndefined();
   });
@@ -52,6 +54,32 @@ describe("formatShortTimestamp", () => {
   });
 });
 
+describe("resolveWeekStartsOn", () => {
+  it.each([
+    ["en-US", 0],
+    ["en-GB", 1],
+    ["pl-PL", 1],
+    ["ar-EG", 6],
+  ])("starts the %s week on weekday %i", async (locale, weekday) => {
+    const { resolveWeekStartsOn } = await import("./timestampFormat");
+    expect(resolveWeekStartsOn(locale)).toBe(weekday);
+  });
+
+  it("leaves the default to the caller for a malformed locale", async () => {
+    const { resolveWeekStartsOn } = await import("./timestampFormat");
+    expect(resolveWeekStartsOn("not a locale")).toBeUndefined();
+  });
+
+  it("follows the locale the desktop host reports", async () => {
+    vi.stubGlobal("window", { desktopBridge: { getSystemLocale: () => "en-GB" } });
+    vi.resetModules();
+    const { weekStartsOn } = await import("./timestampFormat");
+    expect(weekStartsOn).toBe(1);
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+});
+
 describe("formatChatTimestampTooltip", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -68,6 +96,33 @@ describe("formatChatTimestampTooltip", () => {
     const date = new Date(2026, 5, 4, 14, 4).toISOString();
 
     expect(format(date, "24-hour")).toBe("14:04, 4th June 2026");
+  });
+});
+
+describe("formatRelativeTimeUntilLabel", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-07T12:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns Expired when the instant is in the past", () => {
+    expect(formatRelativeTimeUntilLabel("2026-04-07T11:59:00.000Z")).toBe("Expired");
+  });
+
+  it("formats seconds remaining", () => {
+    expect(formatRelativeTimeUntilLabel("2026-04-07T12:00:45.000Z")).toBe("45s left");
+  });
+
+  it("formats minutes remaining", () => {
+    expect(formatRelativeTimeUntilLabel("2026-04-07T12:15:00.000Z")).toBe("15m left");
+  });
+
+  it("formats hours remaining", () => {
+    expect(formatRelativeTimeUntilLabel("2026-04-07T18:00:00.000Z")).toBe("6h left");
   });
 });
 
@@ -163,7 +218,33 @@ describe("formatDayAwareTimestamp", () => {
   });
 });
 
+describe("formatUpcomingTimestamp", () => {
+  const now = new Date(2026, 7, 14, 12, 0).getTime();
+
+  it.each([
+    [14, ""],
+    [15, "tomorrow at "],
+    [13, "yesterday at "],
+  ])("keeps the reset day visible for day %i", (day, prefix) => {
+    const resetAt = new Date(2026, 7, day, 14, 30).toISOString();
+    expect(formatUpcomingTimestamp(resetAt, "12-hour", now)).toBe(
+      `${prefix}${formatShortTimestamp(resetAt, "12-hour")}`,
+    );
+  });
+
+  it("preserves the date of an older reset in the transcript", () => {
+    const resetAt = new Date(2026, 7, 12, 14, 30).toISOString();
+    expect(formatUpcomingTimestamp(resetAt, "12-hour", now)).toBe(
+      formatDayAwareTimestamp(resetAt, "12-hour", now),
+    );
+  });
+});
+
 describe("invalid timestamp inputs", () => {
+  it("returns an empty timestamp instead of throwing", () => {
+    expect(formatTimestamp("not-a-date", "12-hour")).toBe("");
+  });
+
   it("returns an empty short timestamp instead of throwing", () => {
     expect(formatShortTimestamp("not-a-date", "12-hour")).toBe("");
   });
@@ -173,13 +254,18 @@ describe("invalid timestamp inputs", () => {
     expect(formatRelativeTimeLabel("not-a-date")).toBe("");
   });
 
-  it("distinguishes missing and invalid relative time state", () => {
-    expect(getRelativeTimeState(null)).toEqual({ status: "missing" });
-    expect(getRelativeTimeState("not-a-date")).toEqual({ status: "invalid" });
+  it("has no relative time boundary for an invalid timestamp", () => {
+    expect(relativeTimeElapsedMs("not-a-date")).toBeNull();
+    expect(msUntilRelativeTimeChange("not-a-date")).toBeNull();
   });
 
   it("returns an empty elapsed duration instead of a NaN label", () => {
     expect(formatElapsedDurationLabel("not-a-date")).toBe("");
+  });
+
+  it("returns an empty relative time until label instead of a NaN label", () => {
+    expect(formatRelativeTimeUntil("not-a-date")).toBeNull();
+    expect(formatRelativeTimeUntilLabel("not-a-date")).toBe("");
   });
 
   it("returns an empty expires-in label instead of a NaN label", () => {
@@ -187,22 +273,29 @@ describe("invalid timestamp inputs", () => {
   });
 });
 
-describe("getRelativeTimeState", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-04-07T12:00:00.000Z"));
+describe("relative time boundaries", () => {
+  const nowMs = Date.parse("2026-04-07T12:00:00.000Z");
+
+  it("waits for the label to change instead of the next second", () => {
+    // "just now" turns into "1m ago" at the one-minute mark.
+    expect(msUntilRelativeTimeChange("2026-04-07T11:59:40.000Z", nowMs)).toBe(40_000);
+    // "2m ago" turns into "3m ago" a minute after the 2m mark.
+    expect(msUntilRelativeTimeChange("2026-04-07T11:57:30.000Z", nowMs)).toBe(30_000);
+    // "3h ago" holds until the 4h mark.
+    expect(msUntilRelativeTimeChange("2026-04-07T08:30:00.000Z", nowMs)).toBe(30 * 60_000);
+    // "2d ago" holds until the 3d mark.
+    expect(msUntilRelativeTimeChange("2026-04-05T00:00:00.000Z", nowMs)).toBe(12 * 3_600_000);
+    // A future timestamp reads "just now" until a minute after it.
+    expect(msUntilRelativeTimeChange("2026-04-07T12:00:10.000Z", nowMs)).toBe(70_000);
+    // A far-future timestamp stays within setTimeout's range.
+    expect(msUntilRelativeTimeChange("2026-06-01T00:00:00.000Z", nowMs)).toBe(86_400_000);
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("returns relative parts for valid timestamps", () => {
-    expect(getRelativeTimeState("2026-04-07T11:45:00.000Z")).toEqual({
-      status: "relative",
-      value: "15m",
-      suffix: "ago",
-    });
+  it("keeps the elapsed snapshot stable while the label is unchanged", () => {
+    const at = "2026-04-07T11:57:30.000Z";
+    expect(relativeTimeElapsedMs(at, nowMs)).toBe(2 * 60_000);
+    expect(relativeTimeElapsedMs(at, nowMs + 29_999)).toBe(2 * 60_000);
+    expect(relativeTimeElapsedMs(at, nowMs + 30_000)).toBe(3 * 60_000);
   });
 });
 

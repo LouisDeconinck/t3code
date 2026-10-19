@@ -1,14 +1,16 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ServerSelfUpdateError, ThreadId } from "@t3tools/contracts";
-import { HostProcessExecutablePath } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as Stream from "effect/Stream";
+import { HttpClient, HttpClientResponse } from "effect/http";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
@@ -21,9 +23,30 @@ interface HarnessOptions {
   readonly mode?: "web" | "desktop";
   readonly managed?: boolean;
   readonly preflight?: "ready" | "blocked";
+  readonly beforeDownload?: Effect.Effect<void>;
   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
   readonly desktopAppUpdate?: DesktopAppUpdate.DesktopAppUpdate["Service"];
 }
+
+const archiveBytes = new TextEncoder().encode("not really a tarball");
+const releaseHttpClient = (order: string[], beforeDownload?: Effect.Effect<void>) =>
+  HttpClient.make((request) =>
+    Effect.gen(function* () {
+      if (request.url.endsWith("/SHA256SUMS")) {
+        const digest = yield* Effect.promise(() => crypto.subtle.digest("SHA-256", archiveBytes));
+        const hex = Array.from(new Uint8Array(digest), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join("");
+        return HttpClientResponse.fromWeb(
+          request,
+          new Response(`${hex}  t3-1.1.0-linux-x64.tar.gz\n`),
+        );
+      }
+      if (beforeDownload) yield* beforeDownload;
+      order.push("download");
+      return HttpClientResponse.fromWeb(request, new Response(archiveBytes));
+    }),
+  );
 
 const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
   options: HarnessOptions = {},
@@ -35,13 +58,11 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
   const runner = ProcessRunner.ProcessRunner.of({
     run: (input) =>
       Effect.gen(function* () {
-        if (input.command === "npm") {
-          order.push("install");
-          const prefix = input.args[input.args.indexOf("--prefix") + 1];
-          if (prefix === undefined) return yield* Effect.die("missing npm prefix");
-          const entry = path.join(prefix, "node_modules", "t3", "dist", "bin.mjs");
-          yield* fs.makeDirectory(path.dirname(entry), { recursive: true }).pipe(Effect.orDie);
-          yield* fs.writeFileString(entry, "export {};\n").pipe(Effect.orDie);
+        if (input.command === "tar") {
+          order.push("extract");
+          const stagingDir = input.args[input.args.indexOf("-C") + 1];
+          if (stagingDir === undefined) return yield* Effect.die("missing tar target");
+          yield* fs.writeFileString(path.join(stagingDir, "t3"), "#!/bin/sh\n").pipe(Effect.orDie);
           return {
             stdout: "",
             stderr: "",
@@ -63,7 +84,6 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
                 launcherProtocol: SERVICE_LAUNCHER_PROTOCOL,
               };
         return {
-          // @effect-diagnostics-next-line preferSchemaOverJson:off - fake child-process stdout.
           stdout: JSON.stringify(result),
           stderr: "",
           code: ChildProcessSpawner.ExitCode(0),
@@ -84,7 +104,7 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
           order.push("accept");
           return "launcher-id";
         })),
-    prepareTrial: Effect.sync((): undefined => undefined),
+    prepareTrial: Effect.undefined,
   });
   const config = yield* ServerConfig.ServerConfig.pipe(
     Effect.provide(ServerConfig.layerTest(process.cwd(), baseDir)),
@@ -99,7 +119,9 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
         run: () => Effect.die("unexpected desktop app update run"),
       },
     ),
-    Effect.provideService(HostProcessExecutablePath, "/usr/bin/node"),
+    Effect.provideService(HttpClient.HttpClient, releaseHttpClient(order, options.beforeDownload)),
+    Effect.provideService(HostProcess.Platform, "linux"),
+    Effect.provideService(HostProcess.Architecture, "x64"),
     Effect.provide(ServerConfig.layer({ ...config, mode: options.mode ?? "web" })),
   );
   return { selfUpdate, order };
@@ -329,7 +351,7 @@ it.layer(NodeServices.layer)("server self update", (it) => {
         method: "boot-service",
         updateId: "launcher-id",
       });
-      expect(order).toEqual(["install", "preflight", "accept"]);
+      expect(order).toEqual(["download", "extract", "preflight", "accept"]);
     }),
   );
 
@@ -367,7 +389,6 @@ it.layer(NodeServices.layer)("server self update", (it) => {
       );
       expect(result).toEqual({ targetVersion: "1.2.0", method: "desktop-app" });
       expect(stages).toEqual(["downloading", "installing"]);
-      // The launcher staging path must not run on the desktop path.
       expect(order).toEqual([]);
     }),
   );
@@ -398,6 +419,48 @@ it.layer(NodeServices.layer)("server self update", (it) => {
       );
       yield* Deferred.succeed(accepted, "launcher-id");
       expect((yield* Fiber.join(first)).updateId).toBe("launcher-id");
+    }),
+  );
+
+  it.effect("keeps preparing after the progress stream closes", () =>
+    Effect.gen(function* () {
+      const releaseDownload = yield* Deferred.make<void>();
+      const sawDownloading = yield* Deferred.make<void>();
+      const accepted = yield* Deferred.make<void>();
+      const { selfUpdate, order } = yield* makeHarness({
+        beforeDownload: Deferred.await(releaseDownload),
+        requestUpdate: () =>
+          Effect.sync(() => {
+            order.push("accept");
+          }).pipe(Effect.andThen(Deferred.succeed(accepted, undefined)), Effect.as("launcher-id")),
+      });
+
+      const consumed = yield* ServerSelfUpdate.updateProgressStream(selfUpdate, {
+        targetVersion: "1.1.0",
+      }).pipe(
+        Stream.tap((event) =>
+          event.type === "progress" && event.stage === "downloading"
+            ? Deferred.succeed(sawDownloading, undefined)
+            : Effect.void,
+        ),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+
+      yield* Deferred.await(sawDownloading);
+      // The socket drop ends the stream. The download is still held.
+      yield* Fiber.interrupt(consumed);
+      expect((yield* selfUpdate.update({ targetVersion: "1.2.0" }).pipe(Effect.flip)).reason).toBe(
+        "A server update is already in progress.",
+      );
+
+      yield* Deferred.succeed(releaseDownload, undefined);
+      // `installing` is offered only after the stream queue has shut down.
+      yield* Deferred.await(accepted);
+      expect(order).toEqual(["download", "extract", "preflight", "accept"]);
+      expect((yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason).toBe(
+        "A server update is already in progress.",
+      );
     }),
   );
 });

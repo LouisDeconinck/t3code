@@ -1,17 +1,3 @@
-/**
- * Device - Schemas for first-class iOS Simulator and Android Emulator support.
- *
- * The server owns device discovery, the streaming helper (expo-device-hub),
- * and the agent driver (agent-device). Clients render the live screen from the
- * server-proxied stream, and agents reach devices through the `device_*` MCP
- * tools plus the `agent-device` CLI the server preconfigures for them.
- *
- * Devices live on a *host*. Only the local host (the machine the server runs
- * on) exists today; the host id is carried everywhere so SSH and cloud hosts
- * can be added without changing the client contract.
- *
- * @module Device
- */
 import { Schema } from "effect";
 
 import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -22,10 +8,8 @@ export type DevicePlatform = typeof DevicePlatform.Type;
 export const DeviceHostId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 export type DeviceHostId = typeof DeviceHostId.Type;
 
-/** The server machine. Always present; other host kinds are future work. */
 export const LOCAL_DEVICE_HOST_ID = "local" as DeviceHostId;
 
-/** SSH aliases and key paths are resolved on the environment server. */
 export const SshDeviceHostConfig = Schema.Struct({
   id: DeviceHostId.check(
     Schema.isPattern(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/),
@@ -46,7 +30,6 @@ export const SshDeviceHostConfigs = Schema.Array(SshDeviceHostConfig).check(
   ),
 );
 
-/** Simulator udid or adb serial (an AVD name while it is not running). */
 export const DeviceId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
 export type DeviceId = typeof DeviceId.Type;
 
@@ -55,18 +38,12 @@ export const DeviceSummary = Schema.Struct({
   id: DeviceId,
   platform: DevicePlatform,
   name: TrimmedNonEmptyString,
-  /** OS label such as "iOS 18.0" or "Android 15.0". */
   version: Schema.String,
   booted: Schema.Boolean,
   physical: Schema.Boolean,
 });
 export type DeviceSummary = typeof DeviceSummary.Type;
 
-/**
- * What the host can do right now. Platforms missing their toolchain are
- * reported rather than hidden so the picker and the agent can explain why a
- * platform is absent instead of showing an empty list.
- */
 export const DevicePlatformAvailability = Schema.Struct({
   platform: DevicePlatform,
   available: Schema.Boolean,
@@ -74,21 +51,31 @@ export const DevicePlatformAvailability = Schema.Struct({
 });
 export type DevicePlatformAvailability = typeof DevicePlatformAvailability.Type;
 
+export const DeviceToolVersion = Schema.Struct({
+  requiredVersion: Schema.String,
+  installedVersions: Schema.Array(Schema.String),
+  runningVersion: Schema.NullOr(Schema.String),
+});
+export type DeviceToolVersion = typeof DeviceToolVersion.Type;
+
+export const DeviceToolVersions = Schema.Struct({
+  hub: DeviceToolVersion,
+  agent: DeviceToolVersion,
+});
+export type DeviceToolVersions = typeof DeviceToolVersions.Type;
+
 export const DeviceHostSummary = Schema.Struct({
   id: DeviceHostId,
   kind: Schema.Literals(["local", "ssh"]),
   label: TrimmedNonEmptyString,
   platforms: Schema.Array(DevicePlatformAvailability),
+  tools: Schema.optional(DeviceToolVersions),
+  toolInspectionError: Schema.optional(Schema.String),
   hubInstalled: Schema.Boolean,
   agentDeviceInstalled: Schema.Boolean,
 });
 export type DeviceHostSummary = typeof DeviceHostSummary.Type;
 
-/**
- * Lifecycle of the helper processes on a host. Tools are installed on first
- * use, so a fresh install spends a while in `installing` before any device can
- * stream; the UI shows that instead of an empty picker.
- */
 export const DeviceHostStatus = Schema.Literals([
   "disabled",
   "idle",
@@ -99,10 +86,6 @@ export const DeviceHostStatus = Schema.Literals([
 ]);
 export type DeviceHostStatus = typeof DeviceHostStatus.Type;
 
-/**
- * A device a thread is looking at. One session per (thread, device); the same
- * device may be open in several threads, since the stream is shared.
- */
 export const DeviceSession = Schema.Struct({
   threadId: ThreadId,
   hostId: DeviceHostId,
@@ -113,6 +96,9 @@ export const DeviceSession = Schema.Struct({
 export type DeviceSession = typeof DeviceSession.Type;
 
 export const DeviceServiceState = Schema.Struct({
+  supportsHostRetry: Schema.optional(Schema.Boolean),
+  supportsToolUpdate: Schema.optional(Schema.Boolean),
+  supportsToolInspection: Schema.optional(Schema.Boolean),
   hosts: Schema.Array(DeviceHostSummary),
   hostStatus: DeviceHostStatus,
   hostStatusDetail: Schema.optional(Schema.String),
@@ -130,13 +116,16 @@ export const DeviceServiceState = Schema.Struct({
   ),
   onboardingCompleted: Schema.Boolean,
   agentAccessEnabled: Schema.Boolean,
-  /** Origin-relative path the client prefixes to hub routes. */
   hubBasePath: Schema.String,
   revision: Schema.Int,
 });
 export type DeviceServiceState = typeof DeviceServiceState.Type;
 
-export const DeviceListInput = Schema.Struct({});
+export const DeviceListInput = Schema.Struct({
+  updateTool: Schema.optional(Schema.Literals(["hub", "agent"])),
+  inspectOnly: Schema.optional(Schema.Boolean),
+  retryHostId: Schema.optional(DeviceHostId),
+});
 export type DeviceListInput = typeof DeviceListInput.Type;
 
 export const DeviceConfigureInput = Schema.Struct({
@@ -173,18 +162,9 @@ export const DeviceShutdownInput = Schema.Struct({
 });
 export type DeviceShutdownInput = typeof DeviceShutdownInput.Type;
 
-// Device settings and actions. Each setting names the platforms that support
-// it; the panel hides the rest. Values are normalized across platforms where
-// both have the concept (appearance, text size) and platform-specific where
-// only one does.
-
 export const DeviceAppearance = Schema.Literals(["light", "dark"]);
 export type DeviceAppearance = typeof DeviceAppearance.Type;
 
-/**
- * iOS content-size categories map onto twelve steps; Android `font_scale`
- * is continuous. Four shared steps cover what people actually reach for.
- */
 export const DeviceTextSize = Schema.Literals(["small", "default", "large", "extra-large"]);
 export type DeviceTextSize = typeof DeviceTextSize.Type;
 
@@ -205,7 +185,6 @@ export const DeviceOrientation = Schema.Literals([
 ]);
 export type DeviceOrientation = typeof DeviceOrientation.Type;
 
-/** Current values as read from the device; `undefined` means unsupported or unread. */
 export const DeviceSettings = Schema.Struct({
   appearance: Schema.optional(DeviceAppearance),
   textSize: Schema.optional(DeviceTextSize),
@@ -223,7 +202,6 @@ export const DeviceSettings = Schema.Struct({
 });
 export type DeviceSettings = typeof DeviceSettings.Type;
 
-/** The app in the foreground, when the platform can tell us. */
 export const DeviceForegroundApp = Schema.Struct({
   id: Schema.String,
   name: Schema.optional(Schema.String),
@@ -325,7 +303,6 @@ export const DeviceActionInput = Schema.Union([
     ...DeviceTarget,
     type: Schema.Literal("sendPush"),
     appId: TrimmedNonEmptyString,
-    /** APNs-style payload; a bare string becomes the alert body. */
     payload: Schema.Union([Schema.String, Schema.Record(Schema.String, Schema.Unknown)]),
   }),
 ]);
@@ -340,6 +317,7 @@ export class DeviceHostUnavailableError extends Schema.TaggedError<DeviceHostUna
   {
     hostId: DeviceHostId,
     reason: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
@@ -441,14 +419,10 @@ export const DeviceError = Schema.Union([
 ]);
 export type DeviceError = typeof DeviceError.Type;
 
-// MCP tool shapes. Kept next to the RPC shapes so the tool surface and the
-// panel describe devices the same way.
-
 export const DeviceToolListResult = Schema.Struct({
   hostStatuses: DeviceServiceState.fields.hostStatuses,
   hosts: Schema.Array(DeviceHostSummary),
   devices: Schema.Array(DeviceSummary),
-  /** Devices already open in this thread's Device panel. */
   open: Schema.Array(Schema.Struct({ hostId: DeviceHostId, deviceId: DeviceId })),
 });
 export type DeviceToolListResult = typeof DeviceToolListResult.Type;
@@ -476,10 +450,8 @@ export type DeviceToolOpenInput = typeof DeviceToolOpenInput.Type;
 
 export const DeviceToolOpenResult = Schema.Struct({
   device: DeviceSummary,
-  /** Ready-to-run agent-device invocation pinned to this device. */
   agentDevice: Schema.Struct({
     command: Schema.String,
-    /** Flags that pin every command to this device, e.g. `--udid <id>`. */
     targetArgs: Schema.Array(Schema.String),
   }),
   quickStart: Schema.String,
@@ -527,6 +499,7 @@ export class DeviceToolUnavailableError extends Schema.TaggedError<DeviceToolUna
   "DeviceToolUnavailableError",
   {
     reason: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
   },
 ) {
   override get message(): string {
@@ -544,3 +517,13 @@ export const DeviceToolError = Schema.Union([
   DeviceActionUnavailableError,
 ]);
 export type DeviceToolError = typeof DeviceToolError.Type;
+
+export function deviceToolInstallMessage(name: string, tool: DeviceToolVersion | undefined) {
+  if (!tool) return `Installing ${name}…`;
+  const previous =
+    tool.runningVersion ??
+    [...tool.installedVersions].sort((a, b) => a.localeCompare(b, "en", { numeric: true })).at(-1);
+  return previous && !tool.installedVersions.includes(tool.requiredVersion)
+    ? `Updating ${name} from ${previous} to ${tool.requiredVersion}…`
+    : `Installing ${name} ${tool.requiredVersion}…`;
+}

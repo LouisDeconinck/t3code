@@ -2,11 +2,13 @@ import { DESKTOP_PREVIEW_RECORDING_CAPTURE_TRIGGER } from "@t3tools/contracts";
 import type { DesktopPreviewRecordingArtifact, ScopedThreadRef } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import * as Schema from "effect/Schema";
-import { Atom } from "effect/unstable/reactivity";
+import { Atom } from "effect/reactivity";
 
 import { previewBridge } from "~/components/preview/previewBridge";
 import { ensureClientSettingsHydrated, getClientSettings } from "~/hooks/useSettings";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
+
+import { createRecordingCompositor } from "./recordingCompositor";
 
 import { acquireBrowserSurfaceActivity } from "./browserSurfaceStore";
 
@@ -112,9 +114,7 @@ type BrowserRecordingLifecycle =
     };
 
 interface ActiveRecording {
-  /** Desktop-scoped identity used by the native capture lease. */
   readonly tabId: string;
-  /** Server-local identity returned by preview automation tools. */
   readonly serverTabId: string;
   readonly threadRef: ScopedThreadRef | null;
   readonly chunks: Blob[];
@@ -123,6 +123,7 @@ interface ActiveRecording {
   releaseSurfaceActivity: (() => void) | null;
   stream: MediaStream | null;
   recorder: MediaRecorder | null;
+  compositor: Awaited<ReturnType<typeof createRecordingCompositor>>;
   savedBlob?: Blob;
   uploadPromise?: Promise<string>;
   lifecycle: BrowserRecordingLifecycle;
@@ -162,8 +163,6 @@ const makeStartingBrowserRecordingLifecycle = (): StartingBrowserRecordingLifecy
     cancelledBeforeGrant: false,
     cancelledBeforeGrantSignal,
     cancelBeforeGrant: () => {
-      // Queue position is unknown during paint/settings warmup. Keep the stop request so a start
-      // that later turns out to be contended can still be cancelled before native capture.
       lifecycle.stopRequestedBeforeGrant = true;
       if (lifecycle.queuedForGrant && !lifecycle.grantStarted && !lifecycle.cancelledBeforeGrant) {
         lifecycle.cancelledBeforeGrant = true;
@@ -251,8 +250,6 @@ const preferredMimeTypes = [
 const createMediaRecorder = (stream: MediaStream): MediaRecorder => {
   const mimeType = preferredMimeTypes.find((candidate) => MediaRecorder.isTypeSupported(candidate));
   const settings = stream.getVideoTracks()[0]?.getSettings();
-  // Browser defaults under-budget native-resolution text and motion. Scale with captured pixels
-  // and frames, while bounding storage and encoder load for very large displays.
   const videoBitsPerSecond = Math.round(
     Math.min(
       50_000_000,
@@ -381,6 +378,8 @@ const captureTabMediaStreamWithTimeout = async (
 };
 
 const clearActiveRecording = (recording: ActiveRecording): void => {
+  recording.compositor?.dispose();
+  recording.compositor = null;
   recording.releaseSurfaceActivity?.();
   recording.releaseSurfaceActivity = null;
   if (activeRecordings.get(recording.tabId) !== recording) return;
@@ -525,6 +524,7 @@ export async function startBrowserRecording(
     releaseSurfaceActivity,
     stream: null,
     recorder: null,
+    compositor: null,
     lifecycle: startingLifecycle,
   };
   activeRecordings.set(tabId, recording);
@@ -534,11 +534,10 @@ export async function startBrowserRecording(
       clearActiveRecording(recording);
       throw cause;
     });
-    const frameRate = getClientSettings().browserRecordingFrameRate;
+    const settings = getClientSettings();
+    const frameRate = settings.browserRecordingFrameRate;
     await waitForBrowserRecordingPaint();
     const throwIfStartupCancelled = async (): Promise<void> => {
-      // Once a grant starts, a stop lets startup finish so the caller receives an artifact.
-      // Only a contended start can be cancelled before it reaches native capture.
       if (activeRecordings.get(tabId) === recording) return;
       try {
         await bridge.recording.stopScreencast(tabId);
@@ -614,7 +613,19 @@ export async function startBrowserRecording(
 
     let recorder: MediaRecorder;
     try {
-      recorder = createMediaRecorder(stream);
+      recording.compositor = await createRecordingCompositor(
+        stream,
+        {
+          showKeyPresses: settings.browserRecordingShowKeyPresses,
+          showMousePresses: settings.browserRecordingShowMousePresses,
+          frameRate,
+        },
+        (listener) =>
+          bridge.recording.onInput((event) => {
+            if (event.tabId === tabId) listener(event.input);
+          }),
+      );
+      recorder = createMediaRecorder(recording.compositor?.stream ?? stream);
       recording.recorder = recorder;
       recorder.addEventListener("dataavailable", (event) => {
         if (event.data.size > 0) chunks.push(event.data);
@@ -694,7 +705,8 @@ const finalizeBrowserRecording = async (
           cause,
         });
       }
-      // Encoding has flushed; release native capture before materializing and saving the file.
+      recording.compositor?.dispose();
+      recording.compositor = null;
       stopMediaStream(recording.stream);
       recording.stream = null;
       const mimeType =
@@ -818,7 +830,6 @@ export function stopBrowserRecording(
   return stopPromise;
 }
 
-/** Joins local stops and shares one upload among concurrent automation requests. */
 export async function stopBrowserRecordingForUpload(
   tabId: string,
   upload: (artifact: DesktopPreviewRecordingArtifact, blob: Blob) => Promise<string>,

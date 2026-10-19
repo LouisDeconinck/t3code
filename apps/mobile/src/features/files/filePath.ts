@@ -1,4 +1,7 @@
-import { isWorkspaceVideoPreviewPath } from "@t3tools/shared/filePreview";
+import {
+  isWorkspaceAudioPreviewPath,
+  isWorkspaceVideoPreviewPath,
+} from "@t3tools/shared/filePreview";
 
 export interface FileBreadcrumb {
   readonly label: string;
@@ -10,12 +13,10 @@ function isWindowsAbsolutePath(value: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
 }
 
-/** A file route holding an absolute path shows a host file outside the workspace. */
 export function isAbsolutePath(value: string): boolean {
   return value.startsWith("/") || isWindowsAbsolutePath(value);
 }
 
-/** Route segments that `normalizeRoutePath` joins back into the same path, root included. */
 export function fileRoutePathSegments(path: string): string[] {
   const segments = path.split("/").filter((segment) => segment.length > 0);
   return path.startsWith("/") ? ["", ...segments] : segments;
@@ -89,7 +90,6 @@ export function resolveWorkspaceRelativeFilePath(
   }
 
   const relativePath = normalizedTarget.slice(normalizedRoot.length + 1);
-  // `/repo/../x` starts with the root but escapes it.
   if (relativePath.split("/").includes("..")) {
     return null;
   }
@@ -98,6 +98,10 @@ export function resolveWorkspaceRelativeFilePath(
 
 export function isVideoPreviewFile(path: string): boolean {
   return isWorkspaceVideoPreviewPath(path);
+}
+
+export function isAudioPreviewFile(path: string): boolean {
+  return isWorkspaceAudioPreviewPath(path.split(/[?#]/, 1)[0] ?? "");
 }
 
 export function isSvgImagePreviewFile(path: string): boolean {
@@ -118,4 +122,14 @@ export function fileBreadcrumbs(projectName: string, relativePath: string): File
       kind: index === parts.length - 1 ? ("file" as const) : ("directory" as const),
     })),
   ];
+}
+
+export function fileHeaderSubtitle(projectName: string, relativePath: string): string {
+  const parentDir = relativePath.slice(
+    0,
+    Math.max(relativePath.lastIndexOf("/"), relativePath.lastIndexOf("\\"), 0),
+  );
+  return isAbsolutePath(relativePath)
+    ? parentDir
+    : [projectName, parentDir].filter(Boolean).join(" · ");
 }

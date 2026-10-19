@@ -1,4 +1,3 @@
-// @effect-diagnostics preferSchemaOverJson:off - the external process fixture emits raw JSON over SSH stdout.
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Net from "@t3tools/shared/Net";
@@ -8,9 +7,9 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
-import * as HttpClient from "effect/unstable/http/HttpClient";
-import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ServerConfig from "../config.ts";
 import * as DeviceHost from "./DeviceHost.ts";
 import * as SshDeviceHost from "./SshDeviceHost.ts";
@@ -20,13 +19,19 @@ it.effect("preserves installed status after probes and cleans failed agent activ
     const fs = yield* FileSystem.FileSystem;
     const home = yield* fs.makeTempDirectoryScoped();
     const modes: string[] = [];
+    const owners: string[] = [];
+    const tunnelArgs: string[][] = [];
+    const tunnelStdins: unknown[] = [];
+    const commandArgs: string[][] = [];
     let forwards = 0;
     let failForward = true;
     let rejectConfig = true;
     const spawner = ChildProcessSpawner.make((command) =>
       Effect.gen(function* () {
         if (command._tag !== "StandardCommand") return yield* Effect.die("Unexpected command");
-        const forwarding = command.args.includes("-N");
+        const forwarding = command.args.includes("-L");
+        (forwarding ? tunnelArgs : commandArgs).push([...command.args]);
+        if (forwarding) tunnelStdins.push(command.options.stdin);
         let output = "";
         if (forwarding) {
           if (failForward) {
@@ -62,6 +67,7 @@ it.effect("preserves installed status after probes and cleans failed agent activ
           );
           const mode = /const mode = "([^"]+)"/.exec(script)?.[1] ?? "";
           modes.push(mode);
+          owners.push(/const owner = "([^"]+)"/.exec(script)?.[1] ?? "");
           output = JSON.stringify({
             nodePath: "/node",
             platforms: [{ platform: "ios", available: true }],
@@ -110,6 +116,12 @@ it.effect("preserves installed status after probes and cleans failed agent activ
       ),
     );
     yield* host.ensureReady(() => Effect.void);
+    yield* SshDeviceHost.probe({ id: "test", label: "Test", target: "test.example" }).pipe(
+      Effect.provide(ServerConfig.layerTest(home, home)),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    );
+    expect(new Set(owners).size).toBe(1);
+    expect(owners[0]).toMatch(/^[a-f0-9]{24}$/);
     expect(forwards).toBe(1);
     expect(modes.filter((mode) => mode === "start")).toHaveLength(2);
     yield* host.platformAvailability("ios");
@@ -125,6 +137,27 @@ it.effect("preserves installed status after probes and cleans failed agent activ
     expect((yield* host.summary).agentDeviceInstalled).toBe(true);
     yield* host.stopAgent;
     expect(forwards).toBe(1);
+    const multiplexingOff = ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"];
+    expect(tunnelArgs.length).toBeGreaterThan(0);
+    for (const args of tunnelArgs) {
+      for (const option of multiplexingOff) {
+        const index = args.indexOf(option);
+        expect(index).toBeGreaterThan(0);
+        expect(args[index - 1]).toBe("-o");
+      }
+      // The tunnel lives only as long as the server holds the write end of its stdin.
+      expect(args).not.toContain("-N");
+      expect(args.slice(args.indexOf("test.example") + 1)).toEqual([
+        "sh",
+        "-c",
+        "'exec cat >/dev/null'",
+      ]);
+    }
+    expect(tunnelStdins).toEqual(tunnelArgs.map(() => "pipe"));
+    expect(commandArgs.length).toBeGreaterThan(0);
+    for (const args of commandArgs) {
+      for (const option of multiplexingOff) expect(args).not.toContain(option);
+    }
     yield* host.stop;
     expect(forwards).toBe(0);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

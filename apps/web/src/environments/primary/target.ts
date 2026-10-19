@@ -1,6 +1,8 @@
 import { PRIMARY_LOCAL_ENVIRONMENT_ID, type DesktopEnvironmentBootstrap } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
+import { isLocalEnvironmentDisabled } from "../../localEnvironment";
+
 const PrimaryEnvironmentTargetSource = Schema.Literals([
   "configured",
   "window-origin",
@@ -57,6 +59,15 @@ export class DesktopEnvironmentBootstrapIncompleteError extends Schema.TaggedErr
   }
 }
 
+export class PrimaryEnvironmentDisabledError extends Schema.TaggedError<PrimaryEnvironmentDisabledError>()(
+  "PrimaryEnvironmentDisabledError",
+  {},
+) {
+  override get message(): string {
+    return "The local environment is disabled.";
+  }
+}
+
 export const isPrimaryEnvironmentUrlInvalidError = Schema.is(PrimaryEnvironmentUrlInvalidError);
 export const isPrimaryEnvironmentProtocolUnsupportedError = Schema.is(
   PrimaryEnvironmentProtocolUnsupportedError,
@@ -76,9 +87,6 @@ export interface PrimaryEnvironmentTarget {
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 
 function getDesktopLocalEnvironmentBootstrap(): DesktopEnvironmentBootstrap | null {
-  // The primary (Windows-native) backend keeps the "primary" id. The
-  // plural list may include a second WSL entry; the primary-target
-  // resolver only cares about the primary, so just find it.
   const bootstraps = window.desktopBridge?.getLocalEnvironmentBootstraps() ?? [];
   return bootstraps.find((entry) => entry.id === PRIMARY_LOCAL_ENVIRONMENT_ID) ?? null;
 }
@@ -276,6 +284,9 @@ export function resolvePrimaryEnvironmentHttpUrl(
   searchParams?: Record<string, string>,
 ): string {
   const primaryTarget = readPrimaryEnvironmentTarget();
+  if (!primaryTarget) {
+    throw new PrimaryEnvironmentDisabledError();
+  }
 
   const url = parseTargetUrl({
     rawValue: resolveHttpRequestBaseUrl(primaryTarget),
@@ -289,7 +300,12 @@ export function resolvePrimaryEnvironmentHttpUrl(
   return url.toString();
 }
 
-export function readPrimaryEnvironmentTarget(): PrimaryEnvironmentTarget {
+// Null only when the desktop app runs with its local environment disabled;
+// every other host has a primary (falling back to the page origin).
+export function readPrimaryEnvironmentTarget(): PrimaryEnvironmentTarget | null {
+  if (isLocalEnvironmentDisabled()) {
+    return null;
+  }
   return (
     resolveDesktopPrimaryTarget() ??
     resolveConfiguredPrimaryTarget() ??

@@ -1,37 +1,27 @@
+import { DeviceHostUpdates } from "./DeviceHostUpdates";
 import type {
   DevicePlatform,
   DeviceServiceState,
   DeviceSummary,
   ScopedThreadRef,
 } from "@t3tools/contracts";
-import {
-  ChevronLeft,
-  Home,
-  Power,
-  RotateCcw,
-  SlidersHorizontal,
-  Smartphone,
-  Square,
-  X,
-} from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Smartphone, X } from "lucide-react";
+import { useEffect, useState } from "react";
 
+import { usePreviewMiniPlayerStore } from "~/previewMiniPlayerStore";
 import { useRightPanelStore, type RightPanelSurface } from "~/rightPanelStore";
 import { Button } from "~/components/ui/button";
 import { DiscoveryList, DiscoveryListRow } from "~/components/ui/discovery-list";
 import { Dialog } from "~/components/ui/dialog";
 import { WizardPopup } from "~/components/ui/wizard";
 import { Spinner } from "~/components/ui/spinner";
-import { Toggle } from "~/components/ui/toggle";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
-import { deviceEnvironment, useDeviceHubAccess, useDeviceState } from "~/state/device";
+import { deviceEnvironment, useDeviceState } from "~/state/device";
 import { formatEnvironmentQueryError } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { DeviceStreamView, type DeviceStreamHandle } from "./DeviceStreamView";
 import { DeviceLoadingView } from "./DeviceLoadingView";
-import { DeviceSetup } from "./DeviceSetup";
-import { DeviceToolsPanel } from "./DeviceToolsPanel";
+import { DeviceSetup, deviceHubReadiness } from "./DeviceSetup";
+import { DeviceWorkspace } from "./DeviceWorkspace";
 import { PreviewPanelShell, type PreviewPanelMode } from "../preview/PreviewPanelShell";
 
 const platformLabel = (platform: DevicePlatform) =>
@@ -40,7 +30,6 @@ const platformLabel = (platform: DevicePlatform) =>
 const deviceKey = (device: Pick<DeviceSummary, "hostId" | "id">) =>
   `${device.hostId}\u0000${device.id}`;
 
-/** Each surface owns one host/device; only the visible surface streams. */
 export function DevicePanel(props: {
   readonly mode: PreviewPanelMode;
   readonly threadRef: ScopedThreadRef;
@@ -53,13 +42,17 @@ export function DevicePanel(props: {
   const list = useAtomCommand(deviceEnvironment.list, { reportFailure: false });
   const open = useAtomCommand(deviceEnvironment.open);
   const close = useAtomCommand(deviceEnvironment.close);
-  const [operationError, setOperationError] = useState<string | null>(null);
-  const [pendingDevice, setPendingDevice] = useState<DeviceSummary | null>(null);
+  // The panel stays mounted across thread switches, so an in-flight open or
+  // power-off is tagged with the thread it belongs to and only shown there.
+  const scope = `${environmentId}\u0000${threadId}`;
+  const [operation, setOperation] = useState<{
+    readonly scope: string;
+    readonly pending: DeviceSummary | null;
+    readonly error: string | null;
+  } | null>(null);
+  const pendingDevice = operation?.scope === scope ? operation.pending : null;
+  const operationError = operation?.scope === scope ? operation.error : null;
   const pendingDeviceKey = pendingDevice ? deviceKey(pendingDevice) : null;
-  const [handle, setHandle] = useState<DeviceStreamHandle | null>(null);
-  const [toolsOpen, setToolsOpen] = useState(false);
-  const [axOverlay, setAxOverlay] = useState(false);
-  const access = useDeviceHubAccess(environmentId);
 
   const hostDisabled = state.hostStatus === "disabled";
 
@@ -69,10 +62,7 @@ export function DevicePanel(props: {
     void list({ environmentId, input: {} });
   }, [environmentId, list, loaded, props.visible, hostDisabled]);
 
-  const sessions = useMemo(
-    () => state.sessions.filter((session) => session.threadId === threadId),
-    [state.sessions, threadId],
-  );
+  const sessions = state.sessions.filter((session) => session.threadId === threadId);
   const activeSession = props.surface.target
     ? sessions.find(
         (session) =>
@@ -86,34 +76,54 @@ export function DevicePanel(props: {
       )
     : undefined;
 
-  const grouped = useMemo(() => groupDevices(state), [state]);
+  const grouped = groupDevices(state);
+
+  const startOperation = (pending: DeviceSummary | null) => {
+    const started = { scope, pending, error: null };
+    setOperation(started);
+    // Returning to the same thread can start a newer operation before this one settles.
+    return (error: string | null) =>
+      setOperation((current) =>
+        current === started ? { ...started, pending: null, error } : current,
+      );
+  };
 
   const selectDevice = async (value: string) => {
     const device = state.devices.find((candidate) => deviceKey(candidate) === value);
     if (!device) return;
-    setOperationError(null);
-    setPendingDevice(device);
-    try {
-      const result = await open({
-        environmentId,
-        input: {
-          threadId,
-          hostId: device.hostId,
-          deviceId: device.id,
-          platform: device.platform,
-        },
+    const settleOperation = startOperation(device);
+    const result = await open({
+      environmentId,
+      input: {
+        threadId,
+        hostId: device.hostId,
+        deviceId: device.id,
+        platform: device.platform,
+      },
+    });
+    if (result._tag === "Failure") settleOperation(formatEnvironmentQueryError(result.cause));
+    else {
+      // The server opened the device for the starting thread, so its tab opens there.
+      useRightPanelStore.getState().openDevice(props.threadRef, {
+        hostId: result.value.hostId,
+        deviceId: result.value.deviceId,
+        platform: device.platform,
+        name: device.name,
       });
-      if (result._tag === "Failure") setOperationError(formatEnvironmentQueryError(result.cause));
-      else
-        useRightPanelStore.getState().openDevice(props.threadRef, {
-          hostId: result.value.hostId,
-          deviceId: result.value.deviceId,
-          platform: device.platform,
-          name: device.name,
-        });
-    } finally {
-      setPendingDevice(null);
+      settleOperation(null);
     }
+  };
+
+  const floatActive = () => {
+    if (!activeDevice) return;
+    usePreviewMiniPlayerStore.getState().open(props.threadRef, {
+      kind: "device",
+      hostId: activeDevice.hostId,
+      deviceId: activeDevice.id,
+      platform: activeDevice.platform,
+      name: activeDevice.name,
+    });
+    useRightPanelStore.getState().close(props.threadRef);
   };
 
   const closeActive = (powerOff: boolean) => {
@@ -122,7 +132,7 @@ export function DevicePanel(props: {
       return;
     }
     if (!activeSession) return;
-    setOperationError(null);
+    const settleOperation = startOperation(null);
     void close({
       environmentId,
       input: {
@@ -132,19 +142,14 @@ export function DevicePanel(props: {
         shutdown: powerOff,
       },
     }).then((result) => {
-      if (result._tag === "Failure") setOperationError(formatEnvironmentQueryError(result.cause));
+      if (result._tag === "Failure") settleOperation(formatEnvironmentQueryError(result.cause));
       else useRightPanelStore.getState().closeSurface(props.threadRef, props.surface.id);
     });
   };
 
   const bootingDevices =
     state.bootingDevices?.filter((device) => device.threadId === threadId) ?? [];
-  const hostReady = Object.values(state.hostStatuses).some((host) => host.status === "ready");
-  const hostBusy =
-    !hostReady &&
-    Object.values(state.hostStatuses).some(
-      (host) => host.status === "installing" || host.status === "starting",
-    );
+  const { ready: hostReady, busy: hostBusy } = deviceHubReadiness(state);
   const unavailablePlatforms = state.hosts.flatMap((host) =>
     host.platforms
       .filter((platform) => !platform.available)
@@ -168,73 +173,17 @@ export function DevicePanel(props: {
 
   return (
     <PreviewPanelShell mode={props.mode}>
-      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b px-2">
-        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {props.surface.target
-            ? `${state.hosts.find((host) => host.id === props.surface.target?.hostId)?.label ?? "Device host"} · ${activeDevice?.version ?? props.surface.target.platform}`
-            : (pendingDevice?.name ?? "Choose a device")}
-        </span>
-        {activeDevice ? (
-          <>
-            <DeviceButton
-              label="Home"
-              onClick={() => handle?.pressButton("home")}
-              disabled={!handle?.inputConnected}
-            >
-              <Home />
-            </DeviceButton>
-            {activeDevice.platform === "android" ? (
-              <>
-                <DeviceButton
-                  label="Back"
-                  onClick={() => handle?.pressButton("back")}
-                  disabled={!handle?.inputConnected}
-                >
-                  <ChevronLeft />
-                </DeviceButton>
-                <DeviceButton
-                  label="Recents"
-                  onClick={() => handle?.pressButton("recents")}
-                  disabled={!handle?.inputConnected}
-                >
-                  <Square />
-                </DeviceButton>
-              </>
-            ) : (
-              <DeviceButton
-                label="Rotate"
-                onClick={() => handle?.rotate()}
-                disabled={!handle?.inputConnected}
-              >
-                <RotateCcw />
-              </DeviceButton>
-            )}
-            <Toggle
-              aria-label="Tools"
-              variant="ghost"
-              size="xs"
-              pressed={toolsOpen}
-              onPressedChange={(pressed) => setToolsOpen(Boolean(pressed))}
-            >
-              <SlidersHorizontal />
-            </Toggle>
-            <DeviceButton label="Power off" onClick={() => closeActive(true)}>
-              <Power />
-            </DeviceButton>
-            <DeviceButton label="Close" onClick={() => closeActive(false)}>
-              <X />
-            </DeviceButton>
-          </>
-        ) : null}
-      </div>
-      {hostReady && state.hostStatusDetail ? (
+      {hostReady && !activeDevice && state.hostStatusDetail ? (
         <div
           role="status"
-          className="whitespace-pre-line border-b px-3 py-2 text-xs text-muted-foreground"
+          aria-label="Device host diagnostics"
+          tabIndex={0}
+          className="max-h-32 shrink-0 overflow-y-auto whitespace-pre-line break-words border-b px-3 py-2 text-xs text-muted-foreground"
         >
           {state.hostStatusDetail}
         </div>
       ) : null}
+      <DeviceHostUpdates state={state} environmentId={environmentId} />
       {bootingDevices.length > 0 ? (
         <div role="status" className="border-b px-3 py-2 text-xs text-muted-foreground">
           Starting {bootingDevices.map((device) => device.name).join(", ")}… This can take a minute.
@@ -250,7 +199,7 @@ export function DevicePanel(props: {
             size="icon-xs"
             variant="ghost"
             aria-label="Dismiss device error"
-            onClick={() => setOperationError(null)}
+            onClick={() => setOperation(null)}
           >
             <X className="size-3" />
           </Button>
@@ -258,34 +207,19 @@ export function DevicePanel(props: {
       ) : null}
       <div className="@container relative flex min-h-0 flex-1">
         {activeDevice && activeSession ? (
-          <>
-            <div className="relative min-h-0 min-w-0 flex-1">
-              <DeviceStreamView
-                key={deviceKey(activeDevice)}
-                environmentId={environmentId}
-                platform={activeDevice.platform}
-                deviceName={activeDevice.name}
-                deviceDescription={`${state.hosts.find((host) => host.id === activeDevice.hostId)?.label ?? "Device host"} · ${activeDevice.version}`}
-                deviceId={activeDevice.id}
-                hostId={activeDevice.hostId}
-                visible={props.visible}
-                axOverlay={axOverlay}
-                onHandle={setHandle}
-              />
-            </div>
-            {toolsOpen ? (
-              <DeviceToolsPanel
-                key={deviceKey(activeDevice)}
-                environmentId={environmentId}
-                device={activeDevice}
-                access={access}
-                axOverlay={axOverlay}
-                onAxOverlayChange={setAxOverlay}
-                onClose={() => setToolsOpen(false)}
-                className="absolute inset-y-0 right-0 z-10 w-full max-w-72 border-l shadow-lg @[560px]:static @[560px]:w-72 @[560px]:shrink-0 @[560px]:shadow-none"
-              />
-            ) : null}
-          </>
+          <DeviceWorkspace
+            key={`${environmentId}\u0000${deviceKey(activeDevice)}`}
+            environmentId={environmentId}
+            device={activeDevice}
+            hostLabel={
+              state.hosts.find((host) => host.id === activeDevice.hostId)?.label ?? "Device host"
+            }
+            hostDiagnostics={state.hostStatusDetail}
+            visible={props.visible}
+            onFloat={floatActive}
+            onClose={() => closeActive(false)}
+            onPowerOff={() => closeActive(true)}
+          />
         ) : pendingDevice || hostBusy || !loaded ? (
           <DeviceLoadingView
             name={pendingDevice?.name ?? "Devices"}
@@ -301,12 +235,12 @@ export function DevicePanel(props: {
                   ? "Opening device…"
                   : "Starting device…"
                 : state.hostStatus === "installing"
-                  ? "Installing device support…"
+                  ? (state.hostStatusDetail ?? "Installing device support…")
                   : "Finding devices…"
             }
           />
         ) : (
-          <div className="flex size-full flex-col overflow-y-auto px-5 py-8 text-sm text-muted-foreground">
+          <div className="scrollbar-gutter-both flex size-full flex-col overflow-y-auto px-5 py-8 text-sm text-muted-foreground">
             <div
               className={cn(
                 "mx-auto flex w-full max-w-xl flex-col gap-6",
@@ -316,7 +250,10 @@ export function DevicePanel(props: {
               {grouped.length === 0 ? (
                 <>
                   <Smartphone className="size-6 opacity-60" />
-                  <p className="max-w-sm">
+                  <p
+                    className="max-h-32 w-full max-w-sm overflow-y-auto whitespace-pre-line break-words"
+                    tabIndex={state.hostStatus === "failed" ? 0 : undefined}
+                  >
                     {state.hostStatus === "failed"
                       ? (state.hostStatusDetail ?? "The device hub failed to start.")
                       : "No simulators or emulators were found on this environment."}
@@ -347,7 +284,7 @@ export function DevicePanel(props: {
                             onClick={() => void selectDevice(deviceKey(device))}
                             action={
                               pendingDeviceKey === deviceKey(device) ? (
-                                <Spinner className="size-3" />
+                                <Spinner size="xs" />
                               ) : (
                                 <span className="text-xs text-muted-foreground">
                                   {device.booted ? "Open" : "Start"}
@@ -371,7 +308,7 @@ export function DevicePanel(props: {
               ) : null}
               {loaded && !hostBusy ? (
                 <Button
-                  className="self-start"
+                  className={grouped.length > 0 ? "self-start" : "self-center"}
                   variant={grouped.length > 0 ? "ghost" : "outline"}
                   size="sm"
                   onClick={() => void list({ environmentId, input: {} })}
@@ -384,32 +321,6 @@ export function DevicePanel(props: {
         )}
       </div>
     </PreviewPanelShell>
-  );
-}
-
-function DeviceButton(props: {
-  readonly label: string;
-  readonly onClick: () => void;
-  readonly disabled?: boolean;
-  readonly children: React.ReactNode;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <Button
-            size="icon-xs"
-            variant="ghost-muted"
-            aria-label={props.label}
-            onClick={props.onClick}
-            disabled={props.disabled ?? false}
-          />
-        }
-      >
-        {props.children}
-      </TooltipTrigger>
-      <TooltipPopup>{props.label}</TooltipPopup>
-    </Tooltip>
   );
 }
 

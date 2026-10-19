@@ -10,7 +10,7 @@ vp i
 vp run dev
 ```
 
-Open the one-time pairing URL printed by the dev runner. The bare origin does not authenticate
+Open the pairing URL printed by the dev runner. The bare origin does not authenticate
 a new browser.
 
 Prefer a container? See [Dev container](../internals/devcontainer.md) for VS Code and Codespaces setup.
@@ -56,6 +56,46 @@ when changing this setup:
 The workarounds live in the [web entry](../../apps/web/src/bootstrap.ts) and
 [Tailwind plugin](../../apps/web/vite/tailwind.ts).
 
+#### Reusable dev credential
+
+Use this only on a hostname where you trust every service. Browsers send cookies to all ports
+on that hostname. Any service you visit there can receive the reusable admin credential,
+including services unrelated to T3 Code. If you run untrusted services on that hostname, keep
+normal per-environment pairing instead.
+
+To use one browser profile across web dev worktrees on the same hostname, generate one fixed
+value once:
+
+```sh
+openssl rand -hex 32
+```
+
+Put that value in the main checkout's gitignored `.env`:
+
+```dotenv
+T3CODE_DEV_AUTH_TOKEN=<the value generated above>
+```
+
+The `t3.json` Setup Worktree action links that file to each worktree's `.env`. The dev runner reads repository env files at startup. `.env.local` and inherited process
+environment values override `.env`, so no per-worktree export is needed after setup.
+
+For a manual worktree or launcher without that link, export the same fixed value instead:
+
+```sh
+export T3CODE_DEV_AUTH_TOKEN="<the value generated above>"
+```
+
+Do not generate a new value at startup. Start or restart `vp run dev --share` after configuration,
+then open its printed startup pairing URL once per browser profile on that hostname. Later web dev
+servers on the same hostname accept the shared cookie across ports. The cookie expires after 30
+days. Reload an old tab if its URL now serves a replacement environment.
+
+The token and startup pairing URLs are reusable administrative secrets. Never put them in a
+commit, pull request, or public output. Every server still seeds its own auth database record at
+startup and keeps its own SQLite data, signing key, and revocation state. Desktop and non-dev
+servers ignore the value. See [environment authentication](../internals/environment-auth.md#reusable-dev-credential)
+for the security model.
+
 ## Checks
 
 Run checks for the files and packages you changed:
@@ -65,6 +105,17 @@ vp test run <files>
 vp lint <files>
 vp run --filter <package> typecheck
 ```
+
+In `apps/web`, a test that renders React or touches the DOM is named `*.browser.test.{ts,tsx}`
+and runs in headless Chromium with the React Compiler on, like the app. There is no jsdom; other
+`*.test.ts` files run in Node.
+
+TypeScript workspaces typecheck with tsc-rs, which has Effect diagnostics built in.
+Keep `typescript`, `@effect/tsgo`, and the `effect-tsgo patch` prepare step: editors
+still use them for Effect quick fixes and refactors. Keep `@effect/tsgo` on the
+effect-tsgo version that tsc-rs ports (see the tsc-rs README), or the two disagree
+on rule names.
+Marketing keeps `astro check` for Astro files.
 
 Use `vp run lint:mobile` for native mobile changes. CI owns the full suite; see
 [ci.yml](../../.github/workflows/ci.yml) for its current jobs.
@@ -150,8 +201,9 @@ rustup target add x86_64-pc-windows-msvc
 rustup target add aarch64-pc-windows-msvc
 ```
 
-NSIS is downloaded by electron-builder. WSL support additionally needs a Linux node-pty prebuild;
-see the [release runbook](./release.md#windows-payload-topology-and-update-validation).
+NSIS is downloaded by electron-builder. WSL support additionally needs the Linux CLI archive
+passed as `--wsl-runtime`; see the
+[release runbook](./release.md#windows-payload-topology-and-update-validation).
 
 ### Signing and passkeys
 

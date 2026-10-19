@@ -1,8 +1,16 @@
+import {
+  composerPullRequestsFromLinks,
+  filterComposerPullRequestMatches,
+} from "@t3tools/shared/composerPullRequestMatches";
+import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/filesystem";
+import { environmentSession } from "./session";
+import { useEnvironmentPresentation } from "./presentation";
 import type { VcsRefTarget } from "@t3tools/client-runtime/state/vcs";
 import type {
   EnvironmentId,
-  OrchestrationThread,
-  ThreadId,
+  OrchestrationV2ProjectedTurnItem,
+  ProjectId,
+  ThreadPullRequestLink,
   VcsListRefsResult,
   VcsRef,
 } from "@t3tools/contracts";
@@ -13,16 +21,17 @@ import {
 } from "@t3tools/client-runtime/state/thread-search";
 import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
+import { turnItemDetailRevision } from "@t3tools/client-runtime/work-log/item-detail";
 import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { AsyncResult, Atom } from "effect/reactivity";
+import { useEffect, useState } from "react";
 
 import { appAtomRegistry } from "./atom-registry";
 import { orchestrationEnvironment } from "./orchestration";
 import { projectEnvironment } from "./projects";
 import { useEnvironmentQuery } from "./query";
-import { useEnvironmentThread } from "./threads";
 import { vcsEnvironment } from "./vcs";
+import { composerPullRequests } from "./pull-requests";
 import {
   buildCheckpointDiffTargets,
   normalizeComposerPathSearchQuery,
@@ -50,13 +59,6 @@ const threadSearchResultsAtom = createThreadSearchResultsAtomFamily({
   labelPrefix: "mobile:thread-search",
 });
 
-export interface ThreadDetailView {
-  readonly data: OrchestrationThread | null;
-  readonly error: string | null;
-  readonly isPending: boolean;
-  readonly isDeleted: boolean;
-}
-
 export interface ComposerPathSearchTarget {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
@@ -78,6 +80,85 @@ export function useDebouncedValue<A>(value: A, delayMs: number): A {
   return debounced;
 }
 
+export function useComposerPullRequestSearch(input: {
+  environmentId: EnvironmentId | null;
+  projectId: ProjectId | null;
+  repository: string | null;
+  threadPullRequests?: ReadonlyArray<ThreadPullRequestLink> | undefined;
+  query: string | null;
+}) {
+  const query = useDebouncedValue(input.query, 180);
+  const linked =
+    input.projectId === null
+      ? []
+      : composerPullRequestsFromLinks(input.threadPullRequests ?? [], input.projectId);
+  const ready =
+    query === input.query &&
+    query !== null &&
+    input.environmentId !== null &&
+    input.projectId !== null &&
+    input.repository !== null;
+  const numeric = query !== null && /^\d*$/.test(query);
+  const list = useEnvironmentQuery(
+    ready
+      ? composerPullRequests.list({
+          environmentId: input.environmentId!,
+          input: {
+            projectId: input.projectId!,
+            state: "all",
+            limit: 200,
+            ...(!numeric && query ? { query } : {}),
+          },
+        })
+      : null,
+  );
+  const number = numeric && query ? Number(query) : null;
+  const hasExact = list.data?.entries.some(
+    (entry) =>
+      entry.number === number && entry.repository.toLowerCase() === input.repository?.toLowerCase(),
+  );
+  const exact = useEnvironmentQuery(
+    ready && number !== null && Number.isSafeInteger(number) && number > 0 && !hasExact
+      ? composerPullRequests.detail({
+          environmentId: input.environmentId!,
+          input: { projectId: input.projectId!, repository: input.repository!, number },
+        })
+      : null,
+  );
+  const entries = (() => {
+    if (!ready) return [];
+    if (numeric) {
+      return filterComposerPullRequestMatches({
+        entries: [...(exact.data ? [exact.data] : []), ...(list.data?.entries ?? [])],
+        linked,
+        projectId: input.projectId!,
+        repository: input.repository!,
+        query: query ?? "",
+        limit: 20,
+      });
+    }
+    const words = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+    const found = [...(exact.data ? [exact.data] : []), ...(list.data?.entries ?? [])].filter(
+      (entry) =>
+        entry.projectId === input.projectId &&
+        entry.repository.toLowerCase() === input.repository?.toLowerCase() &&
+        words.every((word) =>
+          `${entry.title} ${entry.headBranch} ${entry.baseBranch}`.toLowerCase().includes(word),
+        ),
+    );
+    const unique = new Map<number, (typeof found)[number]>();
+    for (const entry of found) if (!unique.has(entry.number)) unique.set(entry.number, entry);
+    return [...unique.values()]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 20);
+  })();
+  return {
+    entries,
+    isPending: input.query !== null && (query !== input.query || list.isPending || exact.isPending),
+    error: list.error ?? list.data?.errors[0]?.message ?? exact.error,
+  };
+}
+
 export function useThreadSearch(
   environmentIds: ReadonlyArray<EnvironmentId>,
   query: string,
@@ -89,10 +170,8 @@ export function useThreadSearch(
   const debouncedQuery = useDebouncedValue(normalizedQuery, THREAD_SEARCH_DEBOUNCE_MS);
   const canSearch = environmentIds.length > 0 && normalizedQuery.length >= 2;
   const settledQuery = canSearch && normalizedQuery === debouncedQuery ? debouncedQuery : null;
-  const searchKey = useMemo(
-    () => (settledQuery === null ? null : makeThreadSearchKey(environmentIds, settledQuery)),
-    [environmentIds, settledQuery],
-  );
+  const searchKey =
+    settledQuery === null ? null : makeThreadSearchKey(environmentIds, settledQuery);
   const result = useAtomValue(
     searchKey === null ? EMPTY_THREAD_SEARCH_ATOM : threadSearchResultsAtom(searchKey),
   );
@@ -100,19 +179,6 @@ export function useThreadSearch(
   return {
     matches: isDebouncing ? EMPTY_THREAD_SEARCH_MATCHES : result.matches,
     isPending: canSearch && (isDebouncing || result.isLoading),
-  };
-}
-
-export function useThreadDetail(
-  environmentId: EnvironmentId | null,
-  threadId: ThreadId | null,
-): ThreadDetailView {
-  const state = useEnvironmentThread(environmentId, threadId);
-  return {
-    data: Option.getOrNull(state.data),
-    error: Option.getOrNull(state.error),
-    isPending: state.status === "synchronizing",
-    isDeleted: state.status === "deleted",
   };
 }
 
@@ -150,29 +216,22 @@ export function usePaginatedBranches(target: VcsRefTarget) {
     cursors: INITIAL_BRANCH_CURSORS,
   });
   const cursors = pagination.targetKey === targetKey ? pagination.cursors : INITIAL_BRANCH_CURSORS;
-  const pageAtoms = useMemo(
-    () =>
-      target.environmentId !== null && target.cwd !== null
-        ? cursors.map((cursor) =>
-            vcsEnvironment.listRefs({
-              environmentId: target.environmentId!,
-              input: {
-                cwd: target.cwd!,
-                ...(query.length > 0 ? { query } : {}),
-                ...(cursor === undefined ? {} : { cursor }),
-                limit: VCS_REF_LIST_LIMIT,
-              },
-            }),
-          )
-        : [],
-    [cursors, query, target.cwd, target.environmentId],
-  );
-  const pagesAtom = useMemo(
-    () =>
-      Atom.make((get) => pageAtoms.map((atom) => get(atom))).pipe(
-        Atom.withLabel(`mobile:vcs-ref-pages:${targetKey ?? "empty"}`),
-      ),
-    [pageAtoms, targetKey],
+  const pageAtoms =
+    target.environmentId !== null && target.cwd !== null
+      ? cursors.map((cursor) =>
+          vcsEnvironment.listRefs({
+            environmentId: target.environmentId!,
+            input: {
+              cwd: target.cwd!,
+              ...(query.length > 0 ? { query } : {}),
+              ...(cursor === undefined ? {} : { cursor }),
+              limit: VCS_REF_LIST_LIMIT,
+            },
+          }),
+        )
+      : [];
+  const pagesAtom = Atom.make((get) => pageAtoms.map((atom) => get(atom))).pipe(
+    Atom.withLabel(`mobile:vcs-ref-pages:${targetKey ?? "empty"}`),
   );
   const results = useAtomValue(pagesAtom);
   const values = results.flatMap((result) => {
@@ -212,14 +271,14 @@ export function usePaginatedBranches(target: VcsRefTarget) {
             : "Failed to load refs.";
         })()
       : null;
-  const refresh = useCallback(() => {
+  const refresh = () => {
     const firstPage = pageAtoms[0];
     setPagination({ targetKey, cursors: INITIAL_BRANCH_CURSORS });
     if (firstPage !== undefined) {
       appAtomRegistry.refresh(firstPage);
     }
-  }, [pageAtoms, targetKey]);
-  const loadNext = useCallback(() => {
+  };
+  const loadNext = () => {
     if (targetKey === null || data?.nextCursor === null || data?.nextCursor === undefined) {
       return;
     }
@@ -230,7 +289,7 @@ export function usePaginatedBranches(target: VcsRefTarget) {
         ? { targetKey, cursors: currentCursors }
         : { targetKey, cursors: [...currentCursors, data.nextCursor!] };
     });
-  }, [data?.nextCursor, targetKey]);
+  };
 
   return {
     data,
@@ -244,49 +303,60 @@ export function usePaginatedBranches(target: VcsRefTarget) {
 }
 
 export function useComposerPathSearch(target: ComposerPathSearchTarget) {
-  const normalizedTarget = useMemo(
-    () => ({
-      environmentId: target.environmentId,
-      cwd: target.cwd,
-      query: normalizeComposerPathSearchQuery(target.query),
-    }),
-    [target.cwd, target.environmentId, target.query],
-  );
+  const normalizedTarget = {
+    environmentId: target.environmentId,
+    cwd: target.cwd,
+    query: normalizeComposerPathSearchQuery(target.query),
+  };
   const debouncedTarget = useDebouncedValue(normalizedTarget, COMPOSER_PATH_SEARCH_DEBOUNCE_MS);
-  const result = useEnvironmentQuery(
+  const fileAccessSession = useEnvironmentQuery(
+    debouncedTarget.environmentId === null
+      ? null
+      : environmentSession.sessionStateAtom(debouncedTarget.environmentId),
+  );
+  const fileEnvironment = useEnvironmentPresentation(debouncedTarget.environmentId);
+  const fileAccess = resolveFilesystemReadAccess({
+    isCatalogReady: fileEnvironment.isReady,
+    connection: fileEnvironment.presentation?.connection ?? null,
+    session: fileAccessSession.data,
+    sessionError: fileAccessSession.error,
+  });
+  const { canReadFiles } = fileAccess;
+  const searchTarget =
     debouncedTarget.environmentId !== null &&
-      debouncedTarget.cwd !== null &&
-      debouncedTarget.query.length > 0
-      ? projectEnvironment.searchEntries({
+    debouncedTarget.cwd !== null &&
+    debouncedTarget.query.length > 0
+      ? {
           environmentId: debouncedTarget.environmentId,
           input: {
             cwd: debouncedTarget.cwd,
             query: debouncedTarget.query,
             limit: COMPOSER_PATH_SEARCH_LIMIT,
           },
-        })
-      : null,
+        }
+      : null;
+  const result = useEnvironmentQuery(
+    canReadFiles && searchTarget !== null ? projectEnvironment.searchEntries(searchTarget) : null,
   );
+  const hasTarget = searchTarget !== null;
 
   return {
     entries: result.data?.entries ?? [],
-    error: result.error,
-    isPending: normalizedTarget.query !== debouncedTarget.query || result.isPending,
+    error:
+      !hasTarget || fileAccess.isPending
+        ? null
+        : canReadFiles
+          ? result.error
+          : (fileAccess.error ?? "This connection cannot search host files."),
+    isPending:
+      normalizedTarget.query !== debouncedTarget.query ||
+      (hasTarget && (fileAccess.isPending || result.isPending)),
     refresh: result.refresh,
   };
 }
 
 export function useCheckpointDiff(target: CheckpointDiffTarget) {
-  const targets = useMemo(
-    () => buildCheckpointDiffTargets(target),
-    [
-      target.environmentId,
-      target.fromTurnCount,
-      target.ignoreWhitespace,
-      target.threadId,
-      target.toTurnCount,
-    ],
-  );
+  const targets = buildCheckpointDiffTargets(target);
   const fullThread = useEnvironmentQuery(
     targets.fullThread === null
       ? null
@@ -296,4 +366,24 @@ export function useCheckpointDiff(target: CheckpointDiffTarget) {
     targets.turn === null ? null : orchestrationEnvironment.turnDiff(targets.turn),
   );
   return targets.fullThread === null ? turn : fullThread;
+}
+
+export function useTurnItemDetail(
+  target: {
+    readonly environmentId: EnvironmentId;
+    readonly row: OrchestrationV2ProjectedTurnItem;
+  } | null,
+) {
+  return useEnvironmentQuery(
+    target === null
+      ? null
+      : orchestrationEnvironment.turnItem({
+          environmentId: target.environmentId,
+          input: {
+            threadId: target.row.sourceThreadId,
+            itemId: target.row.sourceItemId,
+            revision: turnItemDetailRevision(target.row.item),
+          },
+        }),
+  );
 }

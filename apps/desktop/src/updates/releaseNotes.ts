@@ -1,4 +1,6 @@
-import type { DesktopUpdateReleaseNote } from "@t3tools/contracts";
+import type { DesktopUpdateChannel, DesktopUpdateReleaseNote } from "@t3tools/contracts";
+
+import { resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
 
 interface ElectronReleaseNoteInfo {
   readonly version: string;
@@ -122,16 +124,24 @@ interface NormalizedDesktopUpdateReleaseNotes {
   readonly omittedReleaseCount: number;
 }
 
+/**
+ * With `fullChangelog` on (nightly), electron-updater collects every GitHub
+ * release whose version is semver-greater than the running one, whatever train
+ * it belongs to; a maintainers' `-preview.` cut sorts above every `-nightly.`
+ * of the same base version and would lead the list.
+ */
 export function normalizeDesktopUpdateReleaseNotes(
   releaseNotes: unknown,
   fallbackVersion: string,
+  channel: DesktopUpdateChannel,
 ): NormalizedDesktopUpdateReleaseNotes {
-  const rawNotes =
+  const rawNotes = (
     typeof releaseNotes === "string"
       ? [{ version: fallbackVersion, note: releaseNotes }]
       : Array.isArray(releaseNotes)
         ? releaseNotes.filter(isElectronReleaseNoteInfo)
-        : [];
+        : []
+  ).filter((entry) => resolveDefaultDesktopUpdateChannel(entry.version) === channel);
 
   const normalizedNotes = rawNotes.flatMap((entry) => {
     const { items, totalItems } = extractReleaseNoteItems(entry.note);

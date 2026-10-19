@@ -199,7 +199,6 @@ describe("sidebar collision detection", () => {
       expect(at(330)).toBe("active");
       expect(at(317)).toBe("active");
       expect(at(316)).toBe("pinned");
-      // The preview moves the divider; a stationary pointer must not undo the drop target.
       boundaryTop = 400;
       expect(at(316)).toBe("pinned");
       expect(at(399)).toBe("pinned");
@@ -253,6 +252,72 @@ describe("sidebar collision detection", () => {
 });
 
 describe("sidebar drag projection", () => {
+  it.each([
+    ["a2", "a1"],
+    ["p", "a1"],
+    ["s", sidebarMarkerId("pinned-header")],
+    ["z", sidebarMarkerId("settled-header")],
+  ])("restores every row and marker when dragging %s out after hovering %s", (active, over) => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      marker("active-placeholder"),
+      thread("a1", "active"),
+      thread("a2", "active"),
+      marker("snoozed-header"),
+      thread("z", "snoozed"),
+      settledHeader,
+      marker("settled-placeholder"),
+      thread("s", "settled"),
+    ];
+    const input = {
+      items,
+      settledOrder: ["z", "s"],
+      settledExpanded: true,
+      boundaryLabelHeight: 24,
+      snoozedThreadCount: 1,
+    };
+    const reordered = preview(input, active, over);
+    expect([...reordered.values()].some((transform) => transform?.y !== 0)).toBe(true);
+
+    const restored = preview({ ...input, enabled: false }, active, over);
+    for (const transform of restored.values()) expect(transform).toEqual(stationary);
+
+    expect(preview({ ...input, enabled: true }, active, over)).toEqual(reordered);
+  });
+
+  it.each([
+    ["a1", "a2"],
+    ["a1", sidebarMarkerId("settled-header")],
+    ["z", "a2"],
+  ])("keeps sparse shelves at the bottom when dragging %s over %s", (active, over) => {
+    const items = [
+      pinnedHeader,
+      divider,
+      thread("a1", "active"),
+      thread("a2", "active"),
+      marker("snoozed-header"),
+      thread("z", "snoozed"),
+      settledHeader,
+      thread("s", "settled"),
+    ];
+    const strategy = createSidebarSortingStrategy({
+      items,
+      settledOrder: over === sidebarMarkerId("settled-header") ? ["a1", "s"] : ["s"],
+      settledExpanded: true,
+      boundaryLabelHeight: 24,
+      snoozedThreadCount: 1,
+    });
+    const args = layout(items, active, over);
+    for (const rect of args.rects.slice(4)) {
+      rect.top += 400;
+      rect.bottom += 400;
+    }
+    const lastIndex = items.length - 1;
+    expect(strategy({ ...args, index: lastIndex })).toEqual(stationary);
+  });
+
   const pinned = [
     pinnedHeader,
     thread("p1", "pinned"),
@@ -273,7 +338,6 @@ describe("sidebar drag projection", () => {
       settledExpanded: true,
     });
     const args = layout(pinned, active, over);
-    // dnd-kit moves the lifted row by the pointer delta, so only peers matter.
     for (let index = 0; index < pinned.length; index += 1) {
       if (index === args.activeIndex) continue;
       expect(strategy({ ...args, index })).toEqual(verticalListSortingStrategy({ ...args, index }));
@@ -372,8 +436,6 @@ describe("sidebar drag projection", () => {
       settledHeader,
       thread("s", "settled"),
     ];
-    // Reorder inside active: the header gap shifts every row, the divider
-    // gap shifts the active rows and the shelf below by a second label.
     const result = preview(
       { items, settledOrder: [], settledExpanded: true, boundaryLabelHeight: 16 },
       "a2",
@@ -588,6 +650,26 @@ describe("sidebar drag projection", () => {
       sidebarMarkerId("settled-placeholder"),
     );
     expect(result.get(sidebarMarkerId("snoozed-header"))).toEqual({ ...stationary, y: -46 });
+  });
+
+  it("previews a time-ordered inbox drop at its time slot, above the Working shelf", () => {
+    const items = [
+      pinnedHeader,
+      thread("p", "pinned"),
+      divider,
+      thread("a1", "active"),
+      thread("a2", "active"),
+      marker("working-header"),
+      thread("w", "working"),
+      settledHeader,
+      marker("settled-placeholder"),
+    ];
+    const input = { items, settledOrder: [], settledExpanded: false };
+    expect(preview(input, "p", "a1").get("a2")?.y).toBe(0);
+    const byTime = preview({ ...input, activeOrder: ["a1", "a2", "p"] }, "p", "a1");
+    expect(byTime.get("a2")?.y).toBe(-83);
+    expect(byTime.get(sidebarMarkerId("working-header"))).toEqual(stationary);
+    expect(byTime.get("w")).toEqual(stationary);
   });
 
   it("derives missing card geometry from the measured root scale", () => {

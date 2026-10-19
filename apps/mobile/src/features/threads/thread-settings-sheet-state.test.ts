@@ -5,6 +5,7 @@ import { ProviderInstanceId, type ProviderOptionSelection } from "@t3tools/contr
 import type { ModelOption } from "../../lib/modelOptions";
 import {
   canCommitPendingModel,
+  favoritesFirst,
   modelMatchesCatalogQuery,
   pendingModelAfterPress,
 } from "./thread-settings-sheet-state";
@@ -32,6 +33,29 @@ function modelOption(
 }
 
 describe("thread settings sheet state", () => {
+  it("keeps favorites in catalog order ahead of other models", () => {
+    const models = [
+      modelOption("first"),
+      modelOption("second"),
+      modelOption("third"),
+      modelOption("fourth"),
+    ];
+    const favorites = new Set([models[2]!.key, models[0]!.key]);
+
+    expect(favoritesFirst(models, favorites).map((model) => model.selection.model)).toEqual([
+      "first",
+      "third",
+      "second",
+      "fourth",
+    ]);
+    expect(models.map((model) => model.selection.model)).toEqual([
+      "first",
+      "second",
+      "third",
+      "fourth",
+    ]);
+  });
+
   it("matches visible model and provider terms", () => {
     const model = modelOption("gpt-next");
 
@@ -99,6 +123,15 @@ describe("thread settings sheet state", () => {
         pressedIsApplied: false,
       }),
     ).toBe(pressed);
+  });
+
+  it("cannot select a hidden model exposed only for visibility management", () => {
+    const pending = modelOption("gpt-next");
+    expect(
+      canCommitPendingModel(pending, [
+        { providerKey: "codex", providerLabel: "Codex", models: [{ ...pending, isHidden: true }] },
+      ]),
+    ).toBe(false);
   });
 
   it("cannot save a staged model after sign-out removes it from the catalog", () => {

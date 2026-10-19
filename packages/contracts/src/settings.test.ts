@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
+import { type CommandId, ProjectId } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
   ClientSettingsSchema,
   ClientSettingsPatch,
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
+  requiredScopesForProjectMutation,
+  resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
@@ -19,6 +22,174 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+
+describe("ServerSettings response streaming", () => {
+  it("defaults to paragraph buffering", () => {
+    expect(decodeServerSettings({}).responseStreamingMode).toBe("paragraph");
+  });
+
+  it.each(["turn", "paragraph"])(
+    "round-trips %s as an environment setting and project override",
+    (responseStreamingMode) => {
+      const input = {
+        responseStreamingMode,
+        projectSettingsOverrides: { project: { responseStreamingMode } },
+      };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    },
+  );
+
+  it.each(["token", "unsupported"])("rejects %s in settings snapshots and writes", (mode) => {
+    for (const input of [
+      { responseStreamingMode: mode },
+      { projectSettingsOverrides: { project: { responseStreamingMode: mode } } },
+    ]) {
+      expect(() => decodeServerSettings(input)).toThrow();
+      expect(() => decodeServerSettingsPatch(input)).toThrow();
+    }
+  });
+});
+
+describe("storage cleanup settings", () => {
+  it("keeps cleanup disabled for existing installations", () => {
+    expect(decodeServerSettings({}).worktreeCleanup).toBeNull();
+    expect(decodeServerSettings({}).storageCleanup).toEqual({
+      worktreeAfterDays: null,
+      worktreeSettledAfterDays: null,
+      worktreeOnMerge: false,
+      worktreeOnDelete: false,
+      worktreeUnchanged: false,
+      worktreeKeepWhen: "uncommitted-changes",
+      browserArtifactsAfterDays: null,
+      logsAfterDays: null,
+    });
+  });
+
+  it("accepts eight-day retention and disabling one rule without resetting others", () => {
+    expect(decodeServerSettingsPatch({ storageCleanup: { worktreeAfterDays: 8 } })).toEqual({
+      storageCleanup: { worktreeAfterDays: 8 },
+    });
+    expect(decodeServerSettingsPatch({ storageCleanup: { worktreeAfterDays: null } })).toEqual({
+      storageCleanup: { worktreeAfterDays: null },
+    });
+    expect(decodeServerSettingsPatch({ storageCleanup: { worktreeSettledAfterDays: 0 } })).toEqual({
+      storageCleanup: { worktreeSettledAfterDays: 0 },
+    });
+  });
+
+  it("accepts partial custom patches but requires complete stored project rules", () => {
+    expect(
+      decodeServerSettingsPatch({
+        worktreeCleanup: { mode: "custom", rules: { worktreeAfterDays: 8 } },
+      }),
+    ).toEqual({ worktreeCleanup: { mode: "custom", rules: { worktreeAfterDays: 8 } } });
+    expect(() =>
+      decodeServerSettings({
+        projectSettingsOverrides: {
+          project: { worktreeCleanup: { mode: "custom", rules: { worktreeAfterDays: 8 } } },
+        },
+      }),
+    ).toThrow();
+    expect(
+      decodeServerSettings({
+        projectSettingsOverrides: {
+          project: {
+            worktreeCleanup: {
+              mode: "custom",
+              rules: {
+                worktreeAfterDays: null,
+                worktreeOnMerge: false,
+                worktreeOnDelete: false,
+                worktreeUnchanged: false,
+              },
+            },
+          },
+        },
+      }).projectSettingsOverrides[ProjectId.make("project")]?.worktreeCleanup,
+    ).toMatchObject({
+      mode: "custom",
+      rules: { worktreeSettledAfterDays: null, worktreeKeepWhen: "uncommitted-changes" },
+    });
+  });
+
+  it("decodes older custom rules with the default local-file policy", () => {
+    const settings = decodeServerSettings({
+      worktreeCleanup: {
+        mode: "custom",
+        rules: {
+          worktreeAfterDays: 8,
+          worktreeOnMerge: false,
+          worktreeOnDelete: false,
+          worktreeUnchanged: false,
+        },
+      },
+    });
+    expect(settings.worktreeCleanup).toMatchObject({
+      rules: { worktreeKeepWhen: "uncommitted-changes" },
+    });
+    expect(
+      decodeServerSettingsPatch({ storageCleanup: { worktreeKeepWhen: "tracked-changes" } }),
+    ).toEqual({ storageCleanup: { worktreeKeepWhen: "tracked-changes" } });
+    expect(() =>
+      decodeServerSettingsPatch({ storageCleanup: { worktreeKeepWhen: "unknown" } }),
+    ).toThrow();
+  });
+
+  it.each([0, -1, 1.5, 3651])("rejects invalid retention %s", (days) => {
+    expect(() =>
+      decodeServerSettingsPatch({ storageCleanup: { browserArtifactsAfterDays: days } }),
+    ).toThrow();
+  });
+
+  it.each([-1, 1.5, 3651])("rejects invalid settled retention %s", (days) => {
+    expect(() =>
+      decodeServerSettingsPatch({ storageCleanup: { worktreeSettledAfterDays: days } }),
+    ).toThrow();
+  });
+});
+
+describe("ClientSettings rich text composer", () => {
+  it("enables rich text for new and existing settings without a saved preference", () => {
+    expect(decodeClientSettings({}).composerRichTextEnabled).toBe(true);
+    expect(decodeClientSettings({ sendShortcut: "mod-enter" }).composerRichTextEnabled).toBe(true);
+  });
+
+  it("preserves an explicit opt-out through patches and persistence", () => {
+    const preference = { composerRichTextEnabled: false };
+    expect(decodeClientSettingsPatch(preference)).toEqual(preference);
+    expect(encodeClientSettings(decodeClientSettings(preference))).toMatchObject(preference);
+  });
+});
+
+describe("ServerSettings default permissions", () => {
+  it("keeps full access for settings saved before a default was configured", () => {
+    expect(decodeServerSettings({}).defaultRuntimeMode).toBe("full-access");
+    expect(DEFAULT_SERVER_SETTINGS.defaultRuntimeMode).toBe("full-access");
+  });
+
+  it.each(["approval-required", "auto-accept-edits", "auto", "full-access"])(
+    "round-trips %s as an environment default and project override",
+    (defaultRuntimeMode) => {
+      const input = {
+        defaultRuntimeMode,
+        projectSettingsOverrides: { project: { defaultRuntimeMode } },
+      };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    },
+  );
+
+  it("rejects unsupported permission defaults", () => {
+    expect(() => decodeServerSettings({ defaultRuntimeMode: "unsupported" })).toThrow();
+    expect(() => decodeServerSettingsPatch({ defaultRuntimeMode: "unsupported" })).toThrow();
+    expect(() =>
+      decodeServerSettingsPatch({
+        projectSettingsOverrides: { project: { defaultRuntimeMode: "unsupported" } },
+      }),
+    ).toThrow();
+  });
+});
 
 describe("ServerSettings usage price overrides", () => {
   const prices = { inputCostPerMillionTokens: 2, outputCostPerMillionTokens: 8 };
@@ -93,17 +264,6 @@ describe("custom model settings", () => {
       { slug: "named", name: "Named", capabilities },
     ]);
   });
-
-  it("accepts entries at the settings patch boundary", () => {
-    expect(
-      decodeServerSettingsPatch({
-        providers: { codex: { customModels: [{ slug: "x", capabilities }] } },
-      }).providers?.codex?.customModels,
-    ).toEqual([{ slug: "x", capabilities }]);
-    expect(() =>
-      decodeServerSettingsPatch({ providers: { codex: { customModels: [{ name: "no slug" }] } } }),
-    ).toThrow();
-  });
 });
 
 describe("ClaudeSettings auto-compaction", () => {
@@ -124,14 +284,68 @@ describe("ClaudeSettings auto-compaction", () => {
       expect(() => decodeClaudeSettings({ autoCompactWindow: value })).toThrow();
     },
   );
+});
 
-  it("rejects an unsupported threshold at the settings patch boundary", () => {
-    expect(() =>
-      decodeServerSettingsPatch({ providers: { claudeAgent: { autoCompactWindow: "300k" } } }),
-    ).toThrow();
-    expect(
-      decodeServerSettingsPatch({ providers: { claudeAgent: { autoCompactWindow: "300000" } } }),
-    ).toBeDefined();
+describe("ClientSettings notifications", () => {
+  it("requires opt-in when existing settings omit notification preferences", () => {
+    expect(decodeClientSettings({}).notificationMode).toBe("off");
+    expect(decodeClientSettings({}).inAppNotificationsEnabled).toBe(false);
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("inAppNotificationsEnabled");
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("notificationMode");
+  });
+
+  it.each([true, false])(
+    "round-trips in-app notifications set to %s",
+    (inAppNotificationsEnabled) => {
+      const settings = decodeClientSettings({ inAppNotificationsEnabled });
+      expect(encodeClientSettings(settings).inAppNotificationsEnabled).toBe(
+        inAppNotificationsEnabled,
+      );
+      expect(
+        decodeClientSettingsPatch({ inAppNotificationsEnabled }).inAppNotificationsEnabled,
+      ).toBe(inAppNotificationsEnabled);
+    },
+  );
+
+  it.each(["true", 1, null])(
+    "rejects an invalid in-app notification preference %s",
+    (inAppNotificationsEnabled) => {
+      expect(() => decodeClientSettings({ inAppNotificationsEnabled })).toThrow();
+      expect(() => decodeClientSettingsPatch({ inAppNotificationsEnabled })).toThrow();
+    },
+  );
+
+  it.each(["off", "notifications", "sound", "notifications-and-sound"])(
+    "round-trips the %s mode",
+    (notificationMode) => {
+      const settings = decodeClientSettings({ notificationMode });
+      expect(encodeClientSettings(settings).notificationMode).toBe(notificationMode);
+      expect(decodeClientSettingsPatch({ notificationMode }).notificationMode).toBe(
+        notificationMode,
+      );
+    },
+  );
+
+  it.each(["always", true, null])(
+    "rejects unsupported notification mode %s",
+    (notificationMode) => {
+      expect(() => decodeClientSettings({ notificationMode })).toThrow();
+      expect(() => decodeClientSettingsPatch({ notificationMode })).toThrow();
+    },
+  );
+});
+
+describe("ClientSettings default diff file state", () => {
+  it("keeps files collapsed when existing settings omit the preference", () => {
+    expect(decodeClientSettings({}).diffFilesCollapsed).toBe(true);
+  });
+
+  it.each([true, false])("preserves a saved collapsed preference of %s", (diffFilesCollapsed) => {
+    const settings = decodeClientSettings({ diffFilesCollapsed });
+    expect(encodeClientSettings(settings).diffFilesCollapsed).toBe(diffFilesCollapsed);
+    expect(decodeClientSettingsPatch({ diffFilesCollapsed }).diffFilesCollapsed).toBe(
+      diffFilesCollapsed,
+    );
   });
 });
 
@@ -152,6 +366,23 @@ describe("ClientSettings diff colors", () => {
   });
 });
 
+describe("ClientSettings chat width", () => {
+  it("keeps the comfortable width for existing settings without a saved width", () => {
+    expect(decodeClientSettings({}).chatWidth).toBe("comfortable");
+  });
+
+  it.each(["comfortable", "wide", "full"])("round-trips the %s width", (chatWidth) => {
+    const settings = decodeClientSettings({ chatWidth });
+    expect(encodeClientSettings(settings).chatWidth).toBe(chatWidth);
+    expect(decodeClientSettingsPatch({ chatWidth }).chatWidth).toBe(chatWidth);
+  });
+
+  it("rejects unsupported widths", () => {
+    expect(() => decodeClientSettings({ chatWidth: "huge" })).toThrow();
+    expect(() => decodeClientSettingsPatch({ chatWidth: "huge" })).toThrow();
+  });
+});
+
 describe("ClientSettings load balancing", () => {
   it("requires opt-in when settings are new or omit load balancing", () => {
     expect(decodeClientSettings({}).loadBalancingEnabled).toBe(false);
@@ -164,6 +395,15 @@ describe("ClientSettings load balancing", () => {
     expect(decodeClientSettingsPatch({ loadBalancingEnabled }).loadBalancingEnabled).toBe(
       loadBalancingEnabled,
     );
+  });
+});
+
+describe("ClientSettings composer context strip", () => {
+  it("defaults to draft-only and accepts a persistent strip preference", () => {
+    expect(decodeClientSettings({}).persistComposerContextStrip).toBe(false);
+    expect(
+      decodeClientSettingsPatch({ persistComposerContextStrip: true }).persistComposerContextStrip,
+    ).toBe(true);
   });
 });
 
@@ -322,6 +562,23 @@ describe("ClientSettings browser recording frame rate", () => {
   });
 });
 
+describe("ClientSettings recording input overlays", () => {
+  it("defaults both overlays off and accepts independent opt-ins", () => {
+    const settings = decodeClientSettings({});
+    expect(settings.browserRecordingShowKeyPresses).toBe(false);
+    expect(settings.browserRecordingShowMousePresses).toBe(false);
+    expect(
+      decodeClientSettingsPatch({
+        browserRecordingShowKeyPresses: true,
+        browserRecordingShowMousePresses: false,
+      }),
+    ).toMatchObject({
+      browserRecordingShowKeyPresses: true,
+      browserRecordingShowMousePresses: false,
+    });
+  });
+});
+
 describe("ClientSettings glass opacity", () => {
   it("defaults to a readable translucent surface", () => {
     expect(decodeClientSettings({}).glassOpacity).toBe(80);
@@ -403,6 +660,14 @@ describe("ClientSettings sidebar", () => {
     expect(decoded).not.toHaveProperty("sidebarV2ConfiguredByUser");
   });
 
+  it("drops the retired compact sidebar keys for users who opted in", () => {
+    const stored = { compactSidebarEnabled: true, sidebarCompactThreadRows: true };
+    const decoded = decodeClientSettings(stored);
+    expect(decoded).not.toHaveProperty("compactSidebarEnabled");
+    expect(decoded).not.toHaveProperty("sidebarCompactThreadRows");
+    expect(decodeClientSettingsPatch(stored)).toEqual({});
+  });
+
   it("preserves an explicit legacy sidebar opt-in", () => {
     expect(decodeClientSettings({ legacySidebarEnabled: true }).legacySidebarEnabled).toBe(true);
     expect(decodeClientSettingsPatch({ legacySidebarEnabled: true }).legacySidebarEnabled).toBe(
@@ -426,6 +691,30 @@ describe("ClientSettings context window meter", () => {
     expect(
       decodeClientSettingsPatch({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
     ).toBe(true);
+  });
+});
+
+describe("ClientSettings send shortcut", () => {
+  it("defaults to Enter and validates the supported choices", () => {
+    expect(decodeClientSettings({}).sendShortcut).toBe("enter");
+    for (const sendShortcut of ["enter", "mod-enter-multiline", "mod-enter"]) {
+      expect(decodeClientSettings({ sendShortcut }).sendShortcut).toBe(sendShortcut);
+      expect(decodeClientSettingsPatch({ sendShortcut }).sendShortcut).toBe(sendShortcut);
+    }
+    expect(() => decodeClientSettingsPatch({ sendShortcut: "invalid" })).toThrow();
+  });
+});
+
+describe("ClientSettings follow-up behavior", () => {
+  it("defaults to queue and accepts either behavior", () => {
+    expect(decodeClientSettings({}).followUpBehavior).toBe("queue");
+    for (const followUpBehavior of ["queue", "steer"]) {
+      expect(decodeClientSettings({ followUpBehavior }).followUpBehavior).toBe(followUpBehavior);
+      expect(decodeClientSettingsPatch({ followUpBehavior }).followUpBehavior).toBe(
+        followUpBehavior,
+      );
+    }
+    expect(() => decodeClientSettingsPatch({ followUpBehavior: "invalid" })).toThrow();
   });
 });
 
@@ -492,14 +781,6 @@ describe("ClientSettings pull request merge methods", () => {
 });
 
 describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
-  it("defaults text generation to Luna at low reasoning effort", () => {
-    expect(DEFAULT_SERVER_SETTINGS.textGenerationModelSelection).toEqual({
-      instanceId: ProviderInstanceId.make("codex"),
-      model: "gpt-5.6-luna",
-      options: [{ id: "reasoningEffort", value: "low" }],
-    });
-  });
-
   it("defaults to an empty record so legacy configs without the key still decode", () => {
     expect(DEFAULT_SERVER_SETTINGS.providerInstances).toEqual({});
   });
@@ -507,9 +788,6 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   it("decodes a fully empty config (legacy on-disk shape) without complaint", () => {
     const decoded = decodeServerSettings({});
     expect(decoded.providerInstances).toEqual({});
-    // Legacy `providers` struct is still hydrated with its per-driver defaults
-    // so existing call sites keep working through the migration.
-    expect(decoded.providers.codex.enabled).toBe(true);
   });
 
   it("decodes a multi-instance map mixing first-party and fork drivers", () => {
@@ -537,9 +815,6 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
 
     expect(decoded.providerInstances[personalId]?.driver).toBe("codex");
     expect(decoded.providerInstances[workId]?.config).toEqual({ homePath: "~/.codex_work" });
-    // Critical: a config naming a driver this build does not know about
-    // (`ollama` is not in `ProviderDriverKind`) must round-trip without loss.
-    // The runtime handles "driver not installed" — the schema must not.
     expect(decoded.providerInstances[ollamaId]?.driver).toBe("ollama");
     expect(decoded.providerInstances[ollamaId]?.config).toEqual({
       endpoint: "http://localhost:11434",
@@ -556,47 +831,38 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
 });
 
 describe("provider enabled defaults", () => {
-  it("enables only the stable bindings by default", () => {
-    const decoded = decodeServerSettings({});
-    expect(decoded.providers.codex.enabled).toBe(true);
-    expect(decoded.providers.claudeAgent.enabled).toBe(true);
-    expect(decoded.providers.cursor.enabled).toBe(false);
-    expect(decoded.providers.grok.enabled).toBe(false);
-    expect(decoded.providers.opencode.enabled).toBe(false);
+  it("keeps Muse disabled until a configured instance opts in", () => {
+    const muse = ProviderDriverKind.make("muse");
+    expect(resolveProviderInstanceEnabled({ driver: muse, config: {} })).toBe(false);
+    expect(resolveProviderInstanceEnabled({ driver: muse, enabled: true, config: {} })).toBe(true);
+    expect(
+      resolveProviderInstanceEnabled({ driver: muse, enabled: true, config: { enabled: false } }),
+    ).toBe(false);
   });
 
-  it("keeps Cursor enabled when an existing user explicitly opted in", () => {
-    const cursor = ProviderDriverKind.make("cursor");
-    const cursorId = ProviderInstanceId.make("cursor");
-    const decoded = decodeServerSettings({
-      providers: { cursor: { enabled: true } },
-      providerInstances: {
-        [cursorId]: { driver: cursor, enabled: true, config: {} },
-      },
-    });
-
-    expect(decoded.providers.cursor.enabled).toBe(true);
-    expect(resolveProviderInstanceEnabled(decoded.providerInstances[cursorId]!)).toBe(true);
+  it("enables only the stable bindings by default", () => {
+    const enabledByDefault = (driver: string) =>
+      resolveProviderInstanceEnabled({ driver: ProviderDriverKind.make(driver), config: {} });
+    expect(enabledByDefault("codex")).toBe(true);
+    expect(enabledByDefault("claudeAgent")).toBe(true);
+    for (const driver of ["cursor", "grok", "muse", "pi", "opencode", "antigravity"]) {
+      expect(enabledByDefault(driver)).toBe(false);
+    }
   });
 
   it("resolves instance enabled state with explicit false winning", () => {
     const grok = ProviderDriverKind.make("grok");
     const codex = ProviderDriverKind.make("codex");
-    // No flags anywhere: driver default applies.
     expect(resolveProviderInstanceEnabled({ driver: grok, config: {} })).toBe(false);
     expect(resolveProviderInstanceEnabled({ driver: codex, config: {} })).toBe(true);
-    // Unknown fork drivers stay enabled.
     expect(
       resolveProviderInstanceEnabled({ driver: ProviderDriverKind.make("ollama"), config: {} }),
     ).toBe(true);
-    // Envelope flag wins over the driver default.
     expect(resolveProviderInstanceEnabled({ driver: grok, enabled: true, config: {} })).toBe(true);
     expect(resolveProviderInstanceEnabled({ driver: codex, enabled: false, config: {} })).toBe(
       false,
     );
-    // Legacy in-config flag fills in when the envelope is silent.
     expect(resolveProviderInstanceEnabled({ driver: grok, config: { enabled: true } })).toBe(true);
-    // Conflicting flags: the explicit false wins, whichever side it is on.
     expect(
       resolveProviderInstanceEnabled({ driver: grok, enabled: true, config: { enabled: false } }),
     ).toBe(false);
@@ -607,6 +873,27 @@ describe("provider enabled defaults", () => {
 });
 
 describe("ServerSettings worktree defaults", () => {
+  it("defaults the thread env mode to inherit and keeps stored values", () => {
+    expect(decodeServerSettings({}).defaultThreadEnvMode).toBeNull();
+    expect(decodeServerSettings({ defaultThreadEnvMode: "worktree" }).defaultThreadEnvMode).toBe(
+      "worktree",
+    );
+    expect(
+      decodeServerSettings({ defaultThreadEnvMode: "remote" }).defaultThreadEnvMode,
+    ).toBeNull();
+    expect(
+      decodeServerSettingsPatch({ defaultThreadEnvMode: null }).defaultThreadEnvMode,
+    ).toBeNull();
+  });
+
+  it("keeps an inherited thread env mode off the wire for older clients", () => {
+    const encode = Schema.encodeSync(ServerSettings);
+    expect("defaultThreadEnvMode" in encode(decodeServerSettings({}))).toBe(false);
+    expect(
+      encode(decodeServerSettings({ defaultThreadEnvMode: "worktree" })).defaultThreadEnvMode,
+    ).toBe("worktree");
+  });
+
   it("defaults start-from-origin on for legacy configs", () => {
     expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(true);
   });
@@ -615,6 +902,15 @@ describe("ServerSettings worktree defaults", () => {
     expect(
       decodeServerSettingsPatch({ newWorktreesStartFromOrigin: false }).newWorktreesStartFromOrigin,
     ).toBe(false);
+  });
+
+  it("defaults worktree submodules to inherit and tolerates unknown modes", () => {
+    expect(decodeServerSettings({}).worktreeSubmodules).toBeNull();
+    expect(decodeServerSettings({ worktreeSubmodules: "top-level" }).worktreeSubmodules).toBe(
+      "top-level",
+    );
+    expect(decodeServerSettings({ worktreeSubmodules: "shallow" }).worktreeSubmodules).toBeNull();
+    expect(decodeServerSettingsPatch({ worktreeSubmodules: null }).worktreeSubmodules).toBeNull();
   });
 });
 
@@ -683,13 +979,6 @@ describe("ServerSettingsPatch string normalization", () => {
       observability: {
         otlpTracesUrl: "  http://localhost:4318/v1/traces  ",
       },
-      providers: {
-        codex: {
-          binaryPath: "  /opt/homebrew/bin/codex  ",
-          homePath: "  ~/.codex  ",
-          launchArgs: "  --strict-config --enable foo  ",
-        },
-      },
       providerInstances: {
         codex_personal: {
           driver: "  codex  ",
@@ -702,9 +991,6 @@ describe("ServerSettingsPatch string normalization", () => {
     expect(patch.addProjectBaseDirectory).toBe("~/Development");
     expect(patch.textGenerationModelSelection?.model).toBe("gpt-5.4-mini");
     expect(patch.observability?.otlpTracesUrl).toBe("http://localhost:4318/v1/traces");
-    expect(patch.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
-    expect(patch.providers?.codex?.homePath).toBe("~/.codex");
-    expect(patch.providers?.codex?.launchArgs).toBe("--strict-config --enable foo");
     expect(patch.providerInstances?.[ProviderInstanceId.make("codex_personal")]?.driver).toBe(
       "codex",
     );
@@ -721,19 +1007,9 @@ describe("ServerSettingsPatch string normalization", () => {
     const encoded = encodeServerSettings({
       ...defaultSettings,
       addProjectBaseDirectory: "  ~/Development  ",
-      providers: {
-        ...defaultSettings.providers,
-        codex: {
-          ...defaultSettings.providers.codex,
-          binaryPath: "  /opt/homebrew/bin/codex  ",
-          launchArgs: "  --strict-config  ",
-        },
-      },
     });
 
     expect(encoded.addProjectBaseDirectory).toBe("~/Development");
-    expect(encoded.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
-    expect(encoded.providers?.codex?.launchArgs).toBe("--strict-config");
   });
 });
 
@@ -771,4 +1047,159 @@ it("validates remote device hosts and rejects ambiguous host ids", () => {
     decodeDeviceHostSettings({ deviceHosts: [{ ...host, target: "-oProxyCommand=bad" }] }),
   ).toThrow();
   expect(() => decodeDeviceHostSettings({ deviceHosts: [{ ...host, port: 0 }] })).toThrow();
+});
+
+describe("branch naming settings", () => {
+  it("defaults existing settings to the t3 static prefix", () => {
+    expect(decodeServerSettings({})).toMatchObject({
+      branchNamingMode: "static",
+      branchNamePrefix: "t3",
+      branchNameInstructions: "",
+    });
+  });
+  it.each(["static", "semantic", "custom"])(
+    "round-trips %s and project overrides",
+    (branchNamingMode) => {
+      const naming = {
+        branchNamingMode,
+        branchNamePrefix: "team/",
+        branchNameInstructions: "Include the issue ID.",
+      };
+      const input = { ...naming, projectSettingsOverrides: { project: naming } };
+      expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+      expect(decodeServerSettingsPatch(input)).toEqual(input);
+    },
+  );
+});
+
+describe("ServerSettings.removeAgentCreditsOnMerge", () => {
+  it("keeps agent credits by default and accepts opt-in patches", () => {
+    expect(decodeServerSettings({}).removeAgentCreditsOnMerge).toBe(false);
+    expect(
+      decodeServerSettingsPatch({ removeAgentCreditsOnMerge: true }).removeAgentCreditsOnMerge,
+    ).toBe(true);
+    expect(
+      decodeServerSettings({
+        projectSettingsOverrides: { project: { removeAgentCreditsOnMerge: true } },
+      }).projectSettingsOverrides["project" as ProjectId]?.removeAgentCreditsOnMerge,
+    ).toBe(true);
+  });
+});
+
+describe("resolveProjectProviderInstanceEnabled", () => {
+  const projectId = "project-a" as ProjectId;
+  const instanceId = ProviderInstanceId.make("codex_work");
+
+  it("inherits the machine value when the project has no override", () => {
+    const settings: ServerSettings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: false },
+      },
+    };
+    expect(resolveProjectProviderInstanceEnabled(settings, projectId, instanceId)).toBe(false);
+  });
+
+  it("lets a project enable an instance the machine disabled", () => {
+    const settings: ServerSettings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: false },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+      },
+    };
+    expect(resolveProjectProviderInstanceEnabled(settings, projectId, instanceId)).toBe(true);
+  });
+
+  it("lets a project disable an instance the machine enabled", () => {
+    const settings: ServerSettings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: false } } },
+      },
+    };
+    expect(resolveProjectProviderInstanceEnabled(settings, projectId, instanceId)).toBe(false);
+  });
+
+  it("always resolves to the machine value when no project is in scope", () => {
+    const settings: ServerSettings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+      },
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: false } } },
+      },
+    };
+    expect(resolveProjectProviderInstanceEnabled(settings, null, instanceId)).toBe(true);
+  });
+
+  it("falls back to the unconfigured default when the instance has no settings entry", () => {
+    const settings: ServerSettings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: {} };
+    expect(resolveProjectProviderInstanceEnabled(settings, projectId, instanceId)).toBe(
+      resolveProjectProviderInstanceEnabled(settings, null, instanceId),
+    );
+
+    const overridden = {
+      ...settings,
+      projectSettingsOverrides: {
+        [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+      },
+    };
+    expect(resolveProjectProviderInstanceEnabled(overridden, projectId, instanceId)).toBe(true);
+  });
+});
+
+describe("requiredScopesForProjectMutation", () => {
+  it("adds the settings scope only when a mutation carries scripts", () => {
+    const projectId = "project-1" as ProjectId;
+    const commandId = "command-1" as CommandId;
+    expect(
+      requiredScopesForProjectMutation({ type: "project.update", commandId, projectId }),
+    ).toEqual(["orchestration:operate"]);
+    expect(
+      requiredScopesForProjectMutation({
+        type: "project.update",
+        commandId,
+        projectId,
+        scripts: [],
+      }),
+    ).toEqual(["orchestration:operate", "settings:write"]);
+  });
+});
+
+describe("server model preferences", () => {
+  it("decodes a visibility update scoped to a provider instance and model", () => {
+    const patch = { setModelsHidden: [{ provider: "codex_work", model: "sol", hidden: false }] };
+    expect(decodeServerSettingsPatch(patch)).toEqual(patch);
+    expect(() =>
+      decodeServerSettingsPatch({ setModelsHidden: [{ provider: "codex_work", model: "sol" }] }),
+    ).toThrow();
+  });
+  it("distinguishes unmigrated lists from deliberately cleared lists", () => {
+    expect(decodeServerSettings({})).toMatchObject({
+      favorites: null,
+      providerModelPreferences: null,
+    });
+    const input = { favorites: [], providerModelPreferences: {} };
+    expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+    expect(decodeServerSettingsPatch(input)).toEqual(input);
+  });
+
+  it("round trips favorites and hidden models keyed by provider instance", () => {
+    const input = {
+      favorites: [{ provider: "codex_work", model: "sol" }],
+      providerModelPreferences: { codex_work: { hiddenModels: ["astra"], modelOrder: ["sol"] } },
+    };
+    expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
+    expect(decodeServerSettingsPatch(input)).toEqual(input);
+    expect(decodeServerSettingsPatch({ migrateModelPreferences: input })).toEqual({
+      migrateModelPreferences: input,
+    });
+  });
 });

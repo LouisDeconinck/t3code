@@ -1,17 +1,22 @@
+import { ComposerSelectControl } from "./chat/ComposerControl";
+import { ComposerContextLabel } from "./ComposerContextLabel";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "./ui/tooltip";
+import { useAtomValue } from "@effect/atom-react";
+import { shortcutLabelForCommand } from "../keybindings";
+import { primaryServerKeybindingsAtom } from "../state/server";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { ScaleIcon } from "lucide-react";
-import { memo, useMemo } from "react";
+import { memo } from "react";
 
 import type { EnvironmentOption } from "./BranchToolbar.logic";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
-import { composerFloatingLayerProps } from "./chat/composerEventScope";
+import { useComposerMenuProps } from "./chat/composerEventScope";
 import {
   Select,
   SelectGroup,
   SelectGroupLabel,
   SelectItem,
   SelectPopup,
-  SelectTrigger,
   SelectValue,
 } from "./ui/select";
 
@@ -21,8 +26,6 @@ interface BranchToolbarEnvironmentSelectorProps {
   envLocked: boolean;
   environmentId: EnvironmentId;
   availableEnvironments: readonly EnvironmentOption[];
-  // Absent when there is only one environment to show: the indicator still
-  // renders (as a static label) so remote projects are always identifiable.
   onEnvironmentChange?: (environmentId: EnvironmentId) => void;
 }
 
@@ -34,22 +37,23 @@ export const BranchToolbarEnvironmentSelector = memo(function BranchToolbarEnvir
   availableEnvironments,
   onEnvironmentChange,
 }: BranchToolbarEnvironmentSelectorProps) {
-  const activeEnvironment = useMemo(() => {
-    return availableEnvironments.find((env) => env.environmentId === environmentId) ?? null;
-  }, [availableEnvironments, environmentId]);
-
-  const environmentItems = useMemo(
-    () => [
-      ...(onAutoEnvironment
-        ? [{ value: "auto", label: autoEnvironmentLabel ?? "Auto balance" }]
-        : []),
-      ...availableEnvironments.map((env) => ({
-        value: env.environmentId,
-        label: env.label,
-      })),
-    ],
-    [availableEnvironments, autoEnvironmentLabel, onAutoEnvironment],
+  const composerFloatingLayerProps = useComposerMenuProps();
+  const shortcutLabel = shortcutLabelForCommand(
+    useAtomValue(primaryServerKeybindingsAtom),
+    "composer.host",
   );
+  const activeEnvironment =
+    availableEnvironments.find((env) => env.environmentId === environmentId) ?? null;
+
+  const environmentItems = [
+    ...(onAutoEnvironment
+      ? [{ value: "auto", label: autoEnvironmentLabel ?? "Auto balance" }]
+      : []),
+    ...availableEnvironments.map((env) => ({
+      value: env.environmentId,
+      label: env.label,
+    })),
+  ];
 
   // The static label carries the xs control's height (h-7 sm:h-6) as well as
   // its padding: the composer context strip has no min-height of its own, and
@@ -57,27 +61,23 @@ export const BranchToolbarEnvironmentSelector = memo(function BranchToolbarEnvir
   // a shorter label would drag the seam out of line whenever this label is the
   // only thing in the strip.
   if (envLocked || onEnvironmentChange === undefined) {
-    return (
+    const lockedRow = (
       <span
-        className="inline-flex h-7 min-w-0 max-w-full items-center gap-1 border border-transparent px-[calc(--spacing(2)-1px)] font-normal text-muted-foreground/70 text-xs sm:h-6"
+        className="inline-flex h-7 min-w-0 max-w-full items-center gap-1 border border-transparent px-1.75 font-normal text-muted-foreground/70 text-xs sm:h-6"
         data-composer-context-control
       >
         <EnvironmentMachineIcon
           kind={activeEnvironment?.machine ?? "server"}
           className="size-3 shrink-0"
         />
-        <span
-          data-composer-label
-          className="min-w-0 max-w-[240px] group-data-[compact]/composer-context:max-w-0"
-        >
-          <span
-            data-composer-label-motion
-            className="block w-full min-w-0 max-w-[240px] truncate transition-opacity duration-180 ease-[cubic-bezier(0.32,0.72,0,1)] group-data-[compact]/composer-context:opacity-0 motion-reduce:transition-none"
-          >
-            {activeEnvironment?.label ?? "Run on"}
-          </span>
-        </span>
+        <ComposerContextLabel>{activeEnvironment?.label ?? "Run on"}</ComposerContextLabel>
       </span>
+    );
+    return (
+      <Tooltip>
+        <TooltipTrigger render={lockedRow} />
+        <TooltipPopup>{activeEnvironment?.label ?? "Run on"}</TooltipPopup>
+      </Tooltip>
     );
   }
 
@@ -90,33 +90,35 @@ export const BranchToolbarEnvironmentSelector = memo(function BranchToolbarEnvir
       }
       items={environmentItems}
     >
-      <SelectTrigger
-        variant="ghost"
-        size="xs"
-        className="min-w-0 max-w-full font-normal text-xs!"
-        aria-label="Run on"
-        data-composer-context-control
-      >
-        {autoEnvironmentLabel ? (
-          <ScaleIcon className="size-3 shrink-0" aria-hidden="true" />
-        ) : (
-          <EnvironmentMachineIcon
-            kind={activeEnvironment?.machine ?? "server"}
-            className="size-3 shrink-0"
-          />
-        )}
-        <span
-          data-composer-label
-          className="min-w-0 max-w-[240px] group-data-[compact]/composer-context:max-w-0"
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <ComposerSelectControl
+              size="xs"
+              className="min-w-0 max-w-full"
+              aria-label="Run on"
+              data-composer-shortcut="composer.host"
+              data-composer-context-control
+            />
+          }
         >
-          <span
-            data-composer-label-motion
-            className="block w-full min-w-0 max-w-[240px] truncate transition-opacity duration-180 ease-[cubic-bezier(0.32,0.72,0,1)] group-data-[compact]/composer-context:opacity-0 motion-reduce:transition-none"
-          >
+          {autoEnvironmentLabel ? (
+            <ScaleIcon className="size-3 shrink-0" aria-hidden="true" />
+          ) : (
+            <EnvironmentMachineIcon
+              kind={activeEnvironment?.machine ?? "server"}
+              className="size-3 shrink-0"
+            />
+          )}
+          <ComposerContextLabel>
             <SelectValue />
-          </span>
-        </span>
-      </SelectTrigger>
+          </ComposerContextLabel>
+        </TooltipTrigger>
+        <TooltipPopup>
+          {autoEnvironmentLabel ?? activeEnvironment?.label ?? "Run on"}
+          {shortcutLabel ? ` · ${shortcutLabel}` : null}
+        </TooltipPopup>
+      </Tooltip>
       <SelectPopup alignItemWithTrigger={false} {...composerFloatingLayerProps}>
         <SelectGroup>
           <SelectGroupLabel>Run on</SelectGroupLabel>

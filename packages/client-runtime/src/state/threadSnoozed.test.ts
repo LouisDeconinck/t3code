@@ -13,7 +13,6 @@ import {
   threadWokeAt,
   type ThreadSnoozeShell,
 } from "./threadSettled.ts";
-import type { OrchestrationThreadShell } from "@t3tools/contracts";
 
 const NOW = "2026-04-10T12:00:00.000Z";
 const SNOOZED_AT = "2026-04-10T09:00:00.000Z";
@@ -63,10 +62,7 @@ function makeShell(input: {
   };
 }
 
-type QueuedTurnShell = Pick<
-  OrchestrationThreadShell,
-  "latestUserMessageAt" | "latestTurn" | "session"
->;
+type QueuedTurnShell = Parameters<typeof hasQueuedTurnStart>[0];
 
 function makeQueuedTurnShell(overrides: Partial<QueuedTurnShell> = {}): QueuedTurnShell {
   return { latestUserMessageAt: null, latestTurn: null, session: null, ...overrides };
@@ -103,7 +99,6 @@ describe("effectiveSnoozed", () => {
   });
 
   it("wakes early on a failure that happened after the snooze", () => {
-    // makeShell stamps session.updatedAt at 11:00, after SNOOZED_AT (9:00).
     expect(
       effectiveSnoozed(makeShell({ snoozedUntil: FUTURE_WAKE, sessionStatus: "error" }), {
         now: NOW,
@@ -117,7 +112,6 @@ describe("effectiveSnoozed", () => {
         makeShell({
           snoozedUntil: FUTURE_WAKE,
           sessionStatus: "error",
-          // Snoozed AFTER the error's status edge.
           snoozedAt: "2026-04-10T11:30:00.000Z",
         }),
         { now: NOW },
@@ -193,17 +187,21 @@ describe("canSnooze", () => {
         { now: NOW },
       ),
     ).toBe(false);
+    expect(
+      canSnooze(
+        { ...makeShell({}), latestUserMessageAt: null, pendingSubagentRequest: "approval" },
+        { now: NOW },
+      ),
+    ).toBe(false);
   });
 
   it("refuses a queued turn start — same invisible-pending-work rule as settle", () => {
-    // Fresh user message, no turn has adopted it, within the grace window.
     expect(
       canSnooze(
         { ...makeShell({}), latestUserMessageAt: "2026-04-10T11:59:30.000Z" },
         { now: NOW },
       ),
     ).toBe(false);
-    // Outside the grace window the message is stale data, not queued work.
     expect(
       canSnooze(
         { ...makeShell({}), latestUserMessageAt: "2026-04-10T11:00:00.000Z" },
@@ -290,10 +288,6 @@ describe("threadWokeAt", () => {
   });
 
   it("keeps the early wake authoritative after the scheduled time passes", () => {
-    // Woke early at 10:30 via run-completed; the scheduled wake (PAST_WAKE
-    // 10:00 relative to a later now) has ALSO passed. Reporting the
-    // scheduled time would resurface a Woke pill the user already cleared
-    // by visiting between the early wake and now.
     expect(
       threadWokeAt(
         makeShell({ snoozedUntil: PAST_WAKE, turnCompletedAt: "2026-04-10T09:30:00.000Z" }),
@@ -359,7 +353,6 @@ describe("resolveSnoozePresets", () => {
   });
 
   it("drops next week on Sundays, when it lands on the same Monday as tomorrow", () => {
-    // Sunday 2026-08-30 07:01: "Tomorrow" and "Next week" are both Monday 9:00.
     const presets = resolveSnoozePresets(localDate(2026, 8, 30, 7, 1));
     expect(presets.map((preset) => preset.id)).toEqual([
       "hour",

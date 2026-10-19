@@ -1,7 +1,9 @@
-import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
-import { ChevronLeftIcon, ChevronRightIcon, ImageIcon, TextIcon, XIcon } from "lucide-react";
+import { memo, useEffect, useRef, useState, type ReactNode, type KeyboardEvent } from "react";
+import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+import { Image as ImageGlyph, Text as TextGlyph } from "lucide";
 import { Button } from "../ui/button";
+import { MorphIcon } from "~/components/MorphIcon";
+import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 import type { ExpandedImageItem, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { resolveExternalWebLinkHost } from "./externalLinkContextMenu";
 import { useAssetUrlRefresh, useAssetUrlState } from "../../assets/assetUrls";
@@ -15,8 +17,12 @@ import {
   snapShotAccessibilityDetails,
 } from "./SnapShotAttachmentDetails";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { composerFloatingLayerProps } from "./composerEventScope";
 import { ZoomableImage, type ZoomableImageHandle } from "./ZoomableImage";
+import { composerFloatingLayerProps } from "./composerEventScope";
+import { useAtomValue } from "@effect/atom-react";
+import { Atom } from "effect/reactivity";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
+import { expandedImageKey } from "./ExpandedImagePreview";
 
 interface ExpandedImageDialogProps {
   preview: ExpandedImagePreview;
@@ -24,7 +30,7 @@ interface ExpandedImageDialogProps {
 }
 
 const EXPANDED_MEDIA_STATE_CLASS_NAME =
-  "flex aspect-auto h-48 min-h-0 w-[min(92vw,32rem)] flex-col items-center justify-center gap-3 rounded-lg border border-border/70 bg-black p-6 text-center text-sm text-white shadow-2xl";
+  "flex aspect-auto h-48 min-h-0 w-[min(var(--media-width),32rem)] flex-col items-center justify-center gap-3 rounded-lg border border-border/70 bg-black p-6 text-center text-sm text-white shadow-2xl";
 
 function ExpandedMediaFailure({ children }: { children: ReactNode }) {
   return (
@@ -51,8 +57,8 @@ function ExpandedVideo({ item }: { readonly item: ExpandedImageItem }) {
       originalUrl={item.originalUrl}
       preload="metadata"
       autoPlay={item.autoPlay ?? true}
-      className="block max-h-[86vh] max-w-[92vw] text-center"
-      videoClassName="aspect-auto max-h-[86vh] w-auto max-w-[92vw] rounded-lg border border-border/70 shadow-2xl"
+      className="block max-h-[var(--media-height)] max-w-[var(--media-width)] text-center"
+      videoClassName="aspect-auto max-h-[var(--media-height)] w-auto max-w-[var(--media-width)] rounded-lg border border-border/70 shadow-2xl"
       stateClassName={EXPANDED_MEDIA_STATE_CLASS_NAME}
       onRetry={asset ? refreshAssetUrl : undefined}
     />
@@ -64,10 +70,17 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
   onClose,
 }: ExpandedImageDialogProps) {
   const [imageOffset, setImageOffset] = useState(0);
-  const zoomableImageRef = useRef<ZoomableImageHandle>(null);
   const [failedImageSrc, setFailedImageSrc] = useState<string | null>(null);
   const [accessibilityDetailsSrc, setAccessibilityDetailsSrc] = useState<string | null>(null);
-  const index = (preview.index + imageOffset + preview.images.length) % preview.images.length;
+  const zoomableImageRef = useRef<ZoomableImageHandle>(null);
+  const [returnFocusTarget] = useState(() =>
+    document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  );
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  // JavaScript `%` keeps the sign of the dividend, and a negative index blanks the dialog.
+  const imageCount = preview.images.length;
+  const index =
+    imageCount > 0 ? (((preview.index + imageOffset) % imageCount) + imageCount) % imageCount : 0;
   const item = preview.images[index];
   const source: MediaActionSource = item?.actionsSource ?? {
     kind: item?.type === "video" ? "video" : "image",
@@ -85,14 +98,9 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
       }
     : source;
 
-  const navigateImage = useCallback(
-    (direction: -1 | 1) => {
-      setImageOffset(
-        (current) => (current + direction + preview.images.length) % preview.images.length,
-      );
-    },
-    [preview.images.length],
-  );
+  const navigateImage = (direction: -1 | 1) => {
+    setImageOffset((current) => current + direction);
+  };
 
   // The element that opened the preview gets focus back on close. Without
   // this a close button click leaves focus on the unmounted dialog, and the
@@ -108,37 +116,37 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
     };
   }, []);
 
-  useEffect(() => {
-    const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.defaultPrevented || isContextMenuOpen()) {
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        onClose();
-        return;
-      }
-      if (zoomableImageRef.current?.pan(event.key)) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (preview.images.length <= 1) return;
-      if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        event.stopPropagation();
-        navigateImage(-1);
-        return;
-      }
-      if (event.key !== "ArrowRight") return;
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.defaultPrevented || isContextMenuOpen() || event.target instanceof HTMLVideoElement)
+      return;
+    if (zoomableImageRef.current?.pan(event.key)) {
       event.preventDefault();
       event.stopPropagation();
-      navigateImage(1);
+      return;
+    }
+    if (preview.images.length <= 1) return;
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      event.stopPropagation();
+      navigateImage(-1);
+      return;
+    }
+    if (event.key !== "ArrowRight") return;
+    event.preventDefault();
+    event.stopPropagation();
+    navigateImage(1);
+  };
+
+  useEffect(() => {
+    const onEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || isContextMenuOpen()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigateImage, onClose, preview.images.length]);
+    window.addEventListener("keydown", onEscape, { capture: true });
+    return () => window.removeEventListener("keydown", onEscape, { capture: true });
+  }, [onClose]);
 
   if (!item) return null;
   const mediaLabel = item.type === "video" ? "video" : "image";
@@ -154,121 +162,172 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
     : accessibilityDetails?.format === "json"
       ? "Show accessibility JSON"
       : "Show extracted text";
-  const ContentsIcon = showingAccessibilityDetails ? ImageIcon : TextIcon;
 
-  return createPortal(
-    <div
-      {...composerFloatingLayerProps}
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 px-4 py-6 [-webkit-app-region:no-drag]"
-      role="dialog"
-      aria-modal="true"
-      aria-label={`Expanded ${mediaLabel} preview`}
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
     >
-      <button
-        type="button"
-        className="absolute inset-0 z-0 cursor-zoom-out"
-        aria-label={`Close ${mediaLabel} preview`}
-        onClick={onClose}
-      />
-      {preview.images.length > 1 && (
+      <DialogPopup
+        {...composerFloatingLayerProps}
+        variant="media"
+        showCloseButton={false}
+        bottomStickOnMobile={false}
+        className="row-start-1 h-full max-h-[92vh] w-[92vw] max-w-[92vw] items-center justify-center overflow-visible [--media-width:92vw] [--media-height:min(calc((100vh-var(--native-titlebar-height,0px))*0.86),calc(100vh-var(--native-titlebar-height,0px)-160px))] sm:[--media-width:calc(92vw-96px)]"
+        onKeyDown={onKeyDown}
+        initialFocus={closeButtonRef}
+        finalFocus={() => returnFocusTarget}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) onClose();
+        }}
+      >
+        <DialogTitle className="sr-only">Expanded {mediaLabel} preview</DialogTitle>
         <Button
           type="button"
-          size="icon-xl"
-          variant="overlay"
-          className="absolute left-2 top-1/2 z-20 -translate-y-1/2 sm:left-6"
-          aria-label="Previous image"
-          onClick={() => navigateImage(-1)}
+          ref={closeButtonRef}
+          size="icon-sm"
+          variant="media-close"
+          className="absolute right-0 top-0 z-20"
+          onClick={onClose}
+          aria-label={`Close ${mediaLabel} preview`}
         >
-          <ChevronLeftIcon className="size-7" />
+          <XIcon />
         </Button>
-      )}
-      <MediaActions source={actionsSource}>
-        <div className="relative isolate z-10 max-h-[92vh] max-w-[92vw]">
+        {preview.images.length > 1 && (
           <Button
             type="button"
-            size="icon-xs"
-            variant="ghost"
-            className="absolute right-2 top-2 z-20"
-            onClick={onClose}
-            aria-label={`Close ${mediaLabel} preview`}
+            size="icon"
+            variant="media-navigation"
+            className="left-0 top-auto bottom-0 translate-y-0 sm:top-1/2 sm:bottom-auto sm:-translate-y-1/2"
+            aria-label="Previous media"
+            onClick={() => navigateImage(-1)}
           >
-            <XIcon />
+            <ChevronLeftIcon className="size-5" />
           </Button>
-          {item.type === "video" ? (
-            <ExpandedVideo key={index} item={item} />
-          ) : showingAccessibilityDetails ? (
-            accessibilityDetails ? (
-              <SnapShotAccessibilityData
-                details={accessibilityDetails}
-                className="h-[min(86vh,40rem)] w-[min(92vw,42rem)] animate-[snap-shot-contents-enter_140ms_ease-out] rounded-lg border border-border/70 bg-background p-4 text-xs leading-5 shadow-2xl motion-reduce:animate-none"
+        )}
+        <MediaActions source={actionsSource}>
+          <div className="relative isolate z-10 flex max-h-full max-w-[var(--media-width)] flex-col items-center">
+            {item.type === "video" ? (
+              <ExpandedVideo key={index} item={item} />
+            ) : showingAccessibilityDetails ? (
+              accessibilityDetails ? (
+                <SnapShotAccessibilityData
+                  details={accessibilityDetails}
+                  className="h-[min(var(--media-height),40rem)] w-[min(var(--media-width),42rem)] transition-opacity duration-140 ease-out starting:opacity-0 rounded-lg border border-border/70 bg-background p-4 text-xs leading-5 shadow-2xl motion-reduce:transition-none"
+                />
+              ) : null
+            ) : item.src === null || failedImageSrc === item.src ? (
+              <ExpandedMediaFailure>
+                <p>
+                  {openOriginalLink
+                    ? "This image could not be loaded."
+                    : "Image unavailable. The file may have been moved or deleted."}
+                </p>
+                {openOriginalLink}
+              </ExpandedMediaFailure>
+            ) : (
+              <ZoomableImage
+                ref={zoomableImageRef}
+                key={`${index}:${item.src}`}
+                src={item.src}
+                name={item.name}
+                mimeType={item.mimeType}
+                onError={() => setFailedImageSrc(item.src)}
               />
-            ) : null
-          ) : item.src === null || failedImageSrc === item.src ? (
-            <ExpandedMediaFailure>
-              <p>
-                {openOriginalLink
-                  ? "This image could not be loaded."
-                  : "Image unavailable. The file may have been moved or deleted."}
-              </p>
-              {openOriginalLink}
-            </ExpandedMediaFailure>
-          ) : (
-            <ZoomableImage
-              ref={zoomableImageRef}
-              key={`${index}:${item.src}`}
-              src={item.src}
-              name={item.name}
-              onError={() => setFailedImageSrc(item.src)}
-            />
-          )}
-          <div className="mt-2 flex max-w-[92vw] items-center justify-center gap-1.5 text-xs text-white/80">
-            <span className="truncate">
-              {item.name}
-              {preview.images.length > 1 ? ` (${index + 1}/${preview.images.length})` : ""}
-            </span>
-            {accessibilityDetails && item.source ? (
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      aria-label={contentsLabel}
-                      aria-pressed={showingAccessibilityDetails}
-                      className="[--control-icon-color:currentColor] hover:bg-white/10 hover:text-white"
-                      onClick={() =>
-                        setAccessibilityDetailsSrc(showingAccessibilityDetails ? null : item.src)
-                      }
-                      size="icon-micro"
-                      variant="ghost-muted"
+            )}
+            <div className="mt-2 flex max-w-[var(--media-width)] items-center justify-center gap-1.5 text-xs text-white/80 max-sm:px-10">
+              <span className="truncate" aria-live="polite" aria-atomic="true">
+                {item.name}
+                {preview.images.length > 1 ? ` (${index + 1}/${preview.images.length})` : ""}
+              </span>
+              {accessibilityDetails && item.source ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        aria-label={contentsLabel}
+                        aria-pressed={showingAccessibilityDetails}
+                        onClick={() =>
+                          setAccessibilityDetailsSrc(showingAccessibilityDetails ? null : item.src)
+                        }
+                        size="icon-micro"
+                        variant="overlay"
+                      />
+                    }
+                  >
+                    <MorphIcon
+                      className="size-3"
+                      aria-hidden="true"
+                      icon={showingAccessibilityDetails ? ImageGlyph : TextGlyph}
                     />
-                  }
-                >
-                  <ContentsIcon className="size-3" aria-hidden="true" />
-                </TooltipTrigger>
-                <TooltipPopup side="top">{contentsLabel}</TooltipPopup>
-              </Tooltip>
-            ) : item.source ? (
-              <SnapShotContentsButton
-                source={item.source}
-                side="top"
-                className="hover:bg-white/10 hover:text-white"
-              />
-            ) : null}
+                  </TooltipTrigger>
+                  <TooltipPopup side="top">{contentsLabel}</TooltipPopup>
+                </Tooltip>
+              ) : item.source ? (
+                <SnapShotContentsButton source={item.source} side="top" />
+              ) : null}
+            </div>
           </div>
-        </div>
-      </MediaActions>
-      {preview.images.length > 1 && (
-        <Button
-          type="button"
-          size="icon-xl"
-          variant="overlay"
-          className="absolute right-2 top-1/2 z-20 -translate-y-1/2 sm:right-6"
-          aria-label="Next image"
-          onClick={() => navigateImage(1)}
-        >
-          <ChevronRightIcon className="size-7" />
-        </Button>
-      )}
-    </div>,
-    document.body,
+        </MediaActions>
+        {preview.images.length > 1 && (
+          <Button
+            type="button"
+            size="icon"
+            variant="media-navigation"
+            className="right-0 top-auto bottom-0 translate-y-0 sm:top-1/2 sm:bottom-auto sm:-translate-y-1/2"
+            aria-label="Next media"
+            onClick={() => navigateImage(1)}
+          >
+            <ChevronRightIcon className="size-5" />
+          </Button>
+        )}
+      </DialogPopup>
+    </Dialog>
   );
 });
+
+/**
+ * The chat view's open media preview. It lives outside ChatView so opening or
+ * closing it renders only the dialog host, not the whole chat chrome.
+ */
+const expandedImagePreviewAtom = Atom.make<{
+  readonly threadKey: string;
+  readonly preview: ExpandedImagePreview;
+} | null>(null).pipe(Atom.keepAlive, Atom.withLabel("chat:expanded-image-preview"));
+
+export function openExpandedImagePreview(threadKey: string, preview: ExpandedImagePreview): void {
+  appAtomRegistry.set(expandedImagePreviewAtom, { threadKey, preview });
+}
+
+function closeExpandedImagePreview(): void {
+  appAtomRegistry.set(expandedImagePreviewAtom, null);
+}
+
+function closeExpandedImagePreviewFor(threadKey: string): void {
+  if (appAtomRegistry.get(expandedImagePreviewAtom)?.threadKey === threadKey) {
+    closeExpandedImagePreview();
+  }
+}
+
+export function ExpandedImageDialogHost({ threadKey }: { readonly threadKey: string }) {
+  const state = useAtomValue(expandedImagePreviewAtom);
+  const preview = state?.threadKey === threadKey ? state.preview : null;
+  const item = preview?.images[preview.index];
+  const ownedSrc = item?.ownsSrc === true ? item.src : null;
+  useEffect(() => {
+    if (ownedSrc === null) return;
+    return () => URL.revokeObjectURL(ownedSrc);
+  }, [ownedSrc]);
+  // Leaving the thread (or the chat view) drops its preview.
+  useEffect(() => () => closeExpandedImagePreviewFor(threadKey), [threadKey]);
+  if (preview === null) return null;
+  return (
+    <ExpandedImageDialog
+      key={expandedImageKey(preview)}
+      preview={preview}
+      onClose={closeExpandedImagePreview}
+    />
+  );
+}

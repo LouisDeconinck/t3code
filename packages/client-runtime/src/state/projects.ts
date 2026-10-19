@@ -135,6 +135,15 @@ export function findProjectByPath<T extends { workspaceRoot?: string; cwd?: stri
   });
 }
 
+export function isScratchProject(
+  project: { readonly workspaceRoot: string },
+  scratchWorkspaceRoot: string | null | undefined,
+): boolean {
+  return (
+    scratchWorkspaceRoot != null && findProjectByPath([project], scratchWorkspaceRoot) !== undefined
+  );
+}
+
 export function inferProjectTitleFromPath(value: string): string {
   const normalized = normalizeProjectPathForDispatch(value);
   const absolutePath = splitAbsolutePath(normalized);

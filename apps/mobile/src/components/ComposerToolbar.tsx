@@ -1,36 +1,34 @@
 import type { ComponentProps, ReactNode } from "react";
 import { useCallback, useMemo, useState } from "react";
 import {
+  Platform,
   Pressable,
   ScrollView,
   View,
   type LayoutChangeEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type PressableProps,
   type StyleProp,
   type ViewStyle,
 } from "react-native";
 
 import { cn } from "../lib/cn";
-import { AppText as Text } from "./AppText";
-import { SymbolView } from "./AppSymbol";
+import { AppText as Text } from "./ui/AppText";
+import { SymbolView } from "./ui/AppSymbol";
+import { useAndroidControlSizing } from "./ui/useAndroidControlSizing";
 
 const COMPOSER_TOOLBAR_GAP = 8;
 const COMPOSER_TOOLBAR_FADE_WIDTH = 18;
 const COMPOSER_TOOLBAR_SCROLL_EPSILON = 4;
 
-/**
- * Quiet inline composer control used inside cards and their context rows.
- * Unlike ComposerToolbarButton, this does not draw another pill inside the
- * composer surface, so model and workspace controls read as part of the card.
- */
 export function ComposerInlineControl(props: {
   readonly accessibilityHint?: string;
   readonly accessibilityLabel?: string;
   readonly disabled?: boolean;
   readonly emphasized?: boolean;
   readonly icon?: ComponentProps<typeof SymbolView>["name"];
-  readonly iconNode?: ReactNode;
+  readonly renderIcon?: (size: number) => ReactNode;
   readonly label: string;
   readonly maxWidth?: ViewStyle["maxWidth"];
   readonly onPress?: () => void;
@@ -39,6 +37,7 @@ export function ComposerInlineControl(props: {
   readonly chevronDirection?: "down" | "right";
   readonly showChevron?: boolean;
 }) {
+  const { scale, smallIconSize } = useAndroidControlSizing();
   return (
     <Pressable
       accessibilityLabel={props.accessibilityLabel ?? props.label}
@@ -52,12 +51,17 @@ export function ComposerInlineControl(props: {
       onPress={props.onPress}
       style={{ maxWidth: props.maxWidth ?? 190, opacity: props.disabled ? 0.45 : 1 }}
     >
-      {props.iconNode ? (
-        <View className="size-4 shrink-0 items-center justify-center">{props.iconNode}</View>
+      {props.renderIcon ? (
+        <View
+          className="size-4 shrink-0 items-center justify-center"
+          style={Platform.OS === "android" ? { width: 14 * scale, height: 14 * scale } : undefined}
+        >
+          {props.renderIcon(smallIconSize)}
+        </View>
       ) : props.icon ? (
         <SymbolView
           name={props.icon}
-          size={16}
+          size={smallIconSize}
           tintColorClassName={
             props.emphasized || props.selected ? "accent-icon" : "accent-icon-muted"
           }
@@ -76,7 +80,7 @@ export function ComposerInlineControl(props: {
       {props.showChevron === false ? null : (
         <SymbolView
           name={props.chevronDirection === "right" ? "chevron.right" : "chevron.down"}
-          size={10}
+          size={Math.round(10 * scale)}
           tintColorClassName={
             props.emphasized || props.selected ? "accent-icon" : "accent-icon-muted"
           }
@@ -114,11 +118,8 @@ export function ComposerToolbarRow(props: {
 export function ComposerToolbarScroller(props: {
   readonly children: ReactNode;
   readonly align?: "start" | "end";
-  /** Only for non-Uniwind surfaces such as the native terminal palette. */
   readonly fadeOpaque?: string;
-  /** Only for non-Uniwind surfaces such as the native terminal palette. */
   readonly fadeTransparent?: string;
-  /** Semantic Uniwind surface behind the toolbar. Defaults to card. */
   readonly fadeSurface?: "card" | "sheet";
   readonly contentPaddingRight?: number;
 }) {
@@ -223,7 +224,13 @@ export function ComposerActionButton(props: {
   readonly icon: ComponentProps<typeof SymbolView>["name"];
   readonly onPress: () => void;
   readonly variant?: "primary" | "danger";
+  // Forwarded so a Menu can drive this button as its long-press
+  // anchor: Android injects onLongPress, iOS injects onTouchStart and onPress.
+  readonly onLongPress?: PressableProps["onLongPress"];
+  readonly onTouchStart?: PressableProps["onTouchStart"];
 }) {
+  const { scale, smallIconSize } = useAndroidControlSizing();
+  const circleSize = Math.round(30 * scale);
   return (
     <Pressable
       accessibilityLabel={props.accessibilityLabel}
@@ -232,10 +239,13 @@ export function ComposerActionButton(props: {
       className="size-[44px] shrink-0 items-center justify-center active:opacity-70"
       disabled={props.disabled}
       onPress={props.onPress}
+      onLongPress={props.onLongPress}
+      onTouchStart={props.onTouchStart}
     >
       <View
+        style={{ width: circleSize, height: circleSize }}
         className={cn(
-          "size-[30px] items-center justify-center rounded-full",
+          "items-center justify-center rounded-full",
           props.variant === "danger"
             ? "bg-danger"
             : props.disabled
@@ -245,7 +255,7 @@ export function ComposerActionButton(props: {
       >
         <SymbolView
           name={props.icon}
-          size={16}
+          size={smallIconSize}
           weight="semibold"
           tintColorClassName={
             props.variant === "danger" ? "accent-danger-foreground" : "accent-primary-foreground"
@@ -291,10 +301,6 @@ export function ComposerToolbarButton(props: {
       disabled={props.disabled}
       onPress={props.onPress}
       className={cn(
-        // Default width cap lives in the class chain (not the inline style)
-        // so callers can lift it with max-w-full — flex-filling pills in the
-        // thread composer stretch to the row's edge. The numeric maxWidth
-        // prop still wins via the inline style below.
         "h-11 max-w-[172px] flex-row items-center justify-center rounded-full border active:opacity-70",
         variant === "primary" && "shadow-lg shadow-adaptive-black-a10-a25 disabled:shadow-none",
         isCircle ? "w-11" : "gap-2 px-3.5",

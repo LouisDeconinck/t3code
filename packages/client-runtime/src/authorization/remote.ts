@@ -11,7 +11,7 @@ import * as Effect from "effect/Effect";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import {
   executeEnvironmentHttpRequest,
-  makeEnvironmentHttpApiClient,
+  makeEnvironmentHttpApiGroupClient,
   type RemoteEnvironmentRequestError,
 } from "../rpc/http.ts";
 
@@ -37,8 +37,6 @@ const clientMetadataTokenExchangeFields = (
   };
 };
 
-// The server reads these off the /ws upgrade URL next to wsTicket. Optional on
-// both ends: old servers ignore unknown params, old clients never send them.
 export const appendClientConnectionParams = (
   url: URL,
   clientMetadata: AuthClientPresentationMetadata | undefined,
@@ -93,11 +91,11 @@ export const exchangeRemoteDpopAccessToken = Effect.fn(
   readonly dpopProof: string;
   readonly timeoutMs?: number;
 }) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   const response = yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/oauth/token"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.token({
+    client.token({
       headers: { dpop: input.dpopProof },
       payload: {
         grant_type: AuthTokenExchangeGrantType,
@@ -121,11 +119,11 @@ export const bootstrapRemoteBearerSession = Effect.fn(
   readonly clientMetadata?: AuthClientPresentationMetadata;
   readonly timeoutMs?: number;
 }) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/oauth/token"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.token({
+    client.token({
       headers: {},
       payload: {
         grant_type: AuthTokenExchangeGrantType,
@@ -146,34 +144,13 @@ export const fetchRemoteSessionState = Effect.fn(
   readonly bearerToken: string;
   readonly timeoutMs?: number;
 }) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/api/auth/session"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.session({
+    client.session({
       headers: {
         authorization: `Bearer ${input.bearerToken}`,
-      },
-    }),
-  );
-});
-
-export const fetchRemoteDpopSessionState = Effect.fn(
-  "clientRuntime.authorization.fetchRemoteDpopSessionState",
-)(function* (input: {
-  readonly httpBaseUrl: string;
-  readonly accessToken: string;
-  readonly dpopProof: string;
-  readonly timeoutMs?: number;
-}) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
-  return yield* executeEnvironmentHttpRequest(
-    environmentEndpointUrl(input.httpBaseUrl, "/api/auth/session"),
-    input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.session({
-      headers: {
-        authorization: `DPoP ${input.accessToken}`,
-        dpop: input.dpopProof,
       },
     }),
   );
@@ -186,11 +163,11 @@ export const issueRemoteWebSocketTicket = Effect.fn(
   readonly bearerToken: string;
   readonly timeoutMs?: number;
 }) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/api/auth/websocket-ticket"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.webSocketTicket({
+    client.webSocketTicket({
       headers: {
         authorization: `Bearer ${input.bearerToken}`,
       },
@@ -206,11 +183,11 @@ export const issueRemoteDpopWebSocketTicket = Effect.fn(
   readonly dpopProof: string;
   readonly timeoutMs?: number;
 }) {
-  const client = yield* makeEnvironmentHttpApiClient(input.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiGroupClient(input.httpBaseUrl, "auth");
   return yield* executeEnvironmentHttpRequest(
     environmentEndpointUrl(input.httpBaseUrl, "/api/auth/websocket-ticket"),
     input.timeoutMs ?? DEFAULT_REMOTE_REQUEST_TIMEOUT_MS,
-    client.auth.webSocketTicket({
+    client.webSocketTicket({
       headers: {
         authorization: `DPoP ${input.accessToken}`,
         dpop: input.dpopProof,

@@ -2,26 +2,35 @@ import {
   ServerSelfUpdateError,
   type ServerSelfUpdateCapability,
   type ServerSelfUpdateInput,
+  type ServerSelfUpdateProgressEvent,
   type ServerSelfUpdateProgressStage,
   type ServerSelfUpdateResult,
   type ThreadId,
 } from "@t3tools/contracts";
-import { HostProcessExecutablePath } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as HashSet from "effect/HashSet";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
+import { HttpClient } from "effect/http";
+
+import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
 
 import * as ServerConfig from "../config.ts";
 import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import {
   ensurePinnedRuntimeInstalled,
+  pinnedRuntimeCommand,
   PinnedRuntimeInstallError,
   PinnedRuntimePreflightBlockedError,
 } from "./pinnedRuntime.ts";
@@ -170,7 +179,12 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   const runner = yield* ProcessRunner.ProcessRunner;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const execPath = yield* HostProcessExecutablePath;
+  const platform = yield* HostProcess.Platform;
+  const arch = yield* HostProcess.Architecture;
+  const httpClient = yield* HttpClient.HttpClient;
+  const releaseBaseUrl = Option.getOrUndefined(
+    yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
+  );
   const inFlight = yield* Ref.make(false);
 
   const capability: ServerSelfUpdateCapability | null =
@@ -184,9 +198,6 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
     "cloud.server_self_update.update",
   )(function* (input, reportProgress = () => Effect.void, onHandoffAccepted = () => Effect.void) {
     if (capability === "desktop-managed") {
-      // input.targetVersion is meaningless here: the desktop app's own
-      // update feed decides what it downloads, and the result carries what
-      // it actually got.
       if (desktopAppUpdate.available) {
         return yield* desktopAppUpdate.run(reportProgress);
       }
@@ -216,12 +227,16 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
         fs,
         path,
         runner,
+        httpClient,
+        platform,
+        arch,
+        releaseBaseUrl,
         validate: (runtime) =>
           runner
             .run({
-              command: execPath,
+              command: pinnedRuntimeCommand(runtime).command,
               args: [
-                runtime.entryPath,
+                ...pinnedRuntimeCommand(runtime).args,
                 "__service-preflight",
                 "--database-path",
                 serverConfig.dbPath,
@@ -327,3 +342,26 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
 export const layer = Layer.effect(ServerSelfUpdate, make()).pipe(
   Layer.provide(ProcessRunner.layer),
 );
+
+// The RPC stream used to own this fiber, so a dropped client socket interrupted
+// the download. Offers after the queue shuts down are ignored; the update
+// still finishes, and the in-flight guard stays as it was.
+export const updateProgressStream = (
+  selfUpdate: ServerSelfUpdate["Service"],
+  input: ServerSelfUpdateInput,
+) =>
+  Stream.callback<ServerSelfUpdateProgressEvent, ServerSelfUpdateError>((queue) => {
+    const offer = (event: ServerSelfUpdateProgressEvent) =>
+      Queue.offer(queue, event).pipe(Effect.ignore);
+
+    return selfUpdate
+      .update(input, (stage) => offer({ type: "progress", stage }))
+      .pipe(
+        Effect.flatMap((result) => offer({ type: "complete", result })),
+        Effect.catchTags({
+          ServerSelfUpdateError: (error) => Queue.fail(queue, error).pipe(Effect.ignore),
+        }),
+        Effect.andThen(Queue.end(queue).pipe(Effect.ignore)),
+        Effect.forkDetach,
+      );
+  });

@@ -9,14 +9,17 @@ import {
   mergeComposerDraftContent,
 } from "./use-composer-drafts";
 
-/** Move unsent setup edits into the restored task before reopening its editor. */
 export async function recoverFailedThreadDraft(message: QueuedThreadMessage): Promise<void> {
   const sourceKey = scopedThreadKey(message.environmentId, message.threadId);
   const targetKey = restoredNewTaskDraftKey(message.messageId);
   const source = getComposerDraftSnapshot(sourceKey);
   if (source.text.length === 0 && source.attachments.length === 0) return;
 
-  await mergeComposerDraftContent(targetKey, { text: source.text, attachments: [] });
+  await mergeComposerDraftContent(targetKey, {
+    text: source.text,
+    context: source.context,
+    attachments: [],
+  });
   const existingIds = new Set(
     getComposerDraftSnapshot(targetKey).attachments.map((attachment) => attachment.id),
   );

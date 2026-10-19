@@ -27,7 +27,6 @@ describe("pullRequestChecksState", () => {
     expect(pullRequestChecksState([check("success"), check("pending")])).toBe("pending");
     expect(pullRequestChecksState([check("success"), check("action-required")])).toBe("pending");
     expect(pullRequestChecksState([check("success")])).toBe("passing");
-    // Skipped and neutral are neither a pass nor a failure, so they are no verdict at all.
     expect(pullRequestChecksState([check("skipped"), check("neutral")])).toBe(null);
     expect(pullRequestChecksState([])).toBe(null);
   });
@@ -52,13 +51,15 @@ describe("pullRequestChecksState", () => {
   });
 });
 
-/** Every element of the tree the row returned, so a nested indicator can be looked for. */
 function flatten(node: ReactNode): ReadonlyArray<ReturnType<typeof Object>> {
   const found: unknown[] = [];
   for (const child of Children.toArray(node)) {
     if (!isValidElement(child)) continue;
     found.push(child);
-    found.push(...flatten((child.props as { readonly children?: ReactNode }).children));
+    for (const value of Object.values(child.props as Record<string, unknown>)) {
+      if (isValidElement(value)) found.push(...flatten(value));
+      else if (Array.isArray(value)) found.push(...flatten(value.filter(isValidElement)));
+    }
   }
   return found as ReadonlyArray<ReturnType<typeof Object>>;
 }
@@ -95,6 +96,9 @@ function row(overrides: Partial<EnvironmentPullRequestEntry>): ReactNode {
     showProjectTitle: false,
     showProvider: false,
     onSelect: () => {},
+    speedMode: false,
+    hostActions: new Set(),
+    onActed: () => {},
   });
 }
 

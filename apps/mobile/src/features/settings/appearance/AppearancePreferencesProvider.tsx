@@ -13,7 +13,7 @@ import {
 import { AppState, Appearance, Platform, useColorScheme } from "react-native";
 
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 
 import { ScopedTheme, ScopedVariables, Uniwind } from "uniwind";
 
@@ -45,15 +45,11 @@ import {
 } from "../../../lib/mobileThemeRuntime";
 
 interface AppearancePreferencesContextValue {
-  /** Effective values with base-size derivation applied. Use this for rendering. */
   readonly appearance: ResolvedAppearance;
   readonly themeId: MobileThemeId;
   readonly themeIds: MobileThemeIds;
   readonly themeMode: MobileThemeMode;
   readonly themeAppearance: MobileThemeAppearance;
-  readonly materialYouStyleLayoutEnabled: boolean;
-  readonly materialYouStyleLayoutActive: boolean;
-  readonly setMaterialYouStyleLayoutEnabled: (value: boolean) => void;
   readonly systemColorsAvailable: boolean;
   readonly systemColorsActive: boolean;
   readonly themeVariables: MobileThemeVariables;
@@ -69,9 +65,7 @@ interface AppearancePreferencesContextValue {
   readonly setThemeIdForBothAppearances: (value: MobileThemeId) => void;
   readonly setThemeMode: (value: MobileThemeMode) => void;
   readonly setBaseFontSize: (value: number) => void;
-  /** Pass null to clear the override and follow the base font size. */
   readonly setTerminalFontSize: (value: number | null) => void;
-  /** Pass null to clear the override and follow the base font size. */
   readonly setCodeFontSize: (value: number | null) => void;
   readonly setCodeWordBreak: (value: boolean) => void;
 }
@@ -97,8 +91,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
     [resolvedThemeIds.dark, resolvedThemeIds.light],
   );
   const themeId = themeIds[themeAppearance];
-  const materialYouStyleLayoutEnabled = storedPreferences?.materialYouStyleLayoutEnabled ?? false;
-  const materialYouStyleLayoutActive = Platform.OS === "android" && materialYouStyleLayoutEnabled;
   const systemColorsActive = themeId === "material-you" && isSystemColorsAvailable;
   const [systemColorPalettes, setSystemColorPalettes] = useState(readSystemColorPalettes);
   useEffect(() => {
@@ -120,7 +112,7 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
   }, []);
   const themeVariablesByAppearance = useMemo(() => {
     const resolve = (appearance: MobileThemeAppearance) => {
-      const base = getMobileThemeRuntimeVariables(themeIds[appearance], appearance);
+      const base = getMobileThemeRuntimeVariables(themeIds[appearance], appearance, Platform.OS);
       return themeIds[appearance] === "material-you" && systemColorPalettes
         ? materialYouPaletteToMobileThemeVariables(
             systemColorPalettes[appearance],
@@ -138,8 +130,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
     () => resolveAppearance({ baseFontSize, codeFontSize, codeWordBreak, terminalFontSize }),
     [baseFontSize, codeFontSize, codeWordBreak, terminalFontSize],
   );
-  // Preference patches are optimistic. Keep controls interactive while a save is
-  // in flight so rapid theme choices can supersede one another immediately.
   const isReady = AsyncResult.isSuccess(preferencesResult);
   const runtimeState = useMemo<MobileThemeRuntimeState>(
     () => ({
@@ -182,9 +172,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
 
   const updateThemePreferences = useCallback(
     (patch: Partial<Preferences>) => {
-      // Theme selection owns the visible root ScopedTheme value. Keep its
-      // optimistic atom update urgent so the first frame after a press is the
-      // complete new palette rather than a deferred transition render.
       savePreferences(patch);
     },
     [savePreferences],
@@ -247,13 +234,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
     [runtimeState, syncThemeRuntime, updateThemePreferences],
   );
 
-  const setMaterialYouStyleLayoutEnabled = useCallback(
-    (value: boolean) => {
-      updatePreferences({ materialYouStyleLayoutEnabled: value });
-    },
-    [updatePreferences],
-  );
-
   const setBaseFontSize = useCallback(
     (value: number) => {
       const current = appliedRuntimeStateRef.current ?? runtimeState;
@@ -293,9 +273,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
       themeAppearance,
       systemColorsAvailable: isSystemColorsAvailable,
       systemColorsActive,
-      materialYouStyleLayoutEnabled,
-      materialYouStyleLayoutActive,
-      setMaterialYouStyleLayoutEnabled,
       themeVariables,
       themeVariablesByAppearance,
       systemColorPalettes,
@@ -315,9 +292,6 @@ export function AppearancePreferencesProvider(props: { readonly children: ReactN
       themeMode,
       themeAppearance,
       systemColorsActive,
-      materialYouStyleLayoutEnabled,
-      materialYouStyleLayoutActive,
-      setMaterialYouStyleLayoutEnabled,
       themeVariables,
       themeVariablesByAppearance,
       systemColorPalettes,

@@ -1,10 +1,9 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ProjectId, type ScopedThreadRef } from "@t3tools/contracts";
-import { useMemo } from "react";
 
 import {
   readPullRequestDetailSnapshot,
-  resolveDisplayedPullRequestDetail,
+  resolvePullRequestReferenceHost,
 } from "../components/pullRequest/pullRequestDetail.logic";
 import { gitHubPullRequestBrowserUrl } from "../lib/openPullRequestLink";
 import { selectActiveRightPanelSurface, useRightPanelStore } from "../rightPanelStore";
@@ -13,53 +12,78 @@ import { pullRequestEnvironment } from "../state/pullRequests";
 import { useEnvironmentQuery } from "../state/query";
 import { useSupportsMultiplePullRequests } from "./useSupportsMultiplePullRequests";
 
+type PanelPullRequestSurface = Extract<
+  NonNullable<ReturnType<typeof selectActiveRightPanelSurface>>,
+  { kind: "pull-request" }
+>;
+
+function panelPullRequestReference(
+  requestedReference: PanelPullRequestSurface | null,
+  supportsMultiplePullRequests: boolean,
+  repositoryIdentity: Parameters<typeof resolvePullRequestReferenceHost>[1],
+) {
+  if (requestedReference === null) return null;
+  const input = {
+    projectId: ProjectId.make(requestedReference.projectId),
+    repository: requestedReference.repository,
+    number: requestedReference.number,
+  };
+  return supportsMultiplePullRequests
+    ? resolvePullRequestReferenceHost(
+        {
+          ...input,
+          ...(requestedReference.host === undefined ? {} : { host: requestedReference.host }),
+        },
+        repositoryIdentity,
+      )
+    : input;
+}
+
 export function useOpenPanelPullRequestUrl(threadRef: ScopedThreadRef | null) {
   const surface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, threadRef),
   );
-  const reference = surface?.kind === "pull-request" ? surface : null;
-  const environmentId = reference?.environmentId
-    ? EnvironmentId.make(reference.environmentId)
+  const requestedReference = surface?.kind === "pull-request" ? surface : null;
+  const environmentId = requestedReference?.environmentId
+    ? EnvironmentId.make(requestedReference.environmentId)
     : threadRef?.environmentId;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(environmentId ?? null);
   const project = useProject(
-    reference && environmentId
-      ? scopeProjectRef(environmentId, ProjectId.make(reference.projectId))
+    requestedReference && environmentId
+      ? scopeProjectRef(environmentId, ProjectId.make(requestedReference.projectId))
       : null,
   );
+  const reference = panelPullRequestReference(
+    requestedReference,
+    supportsMultiplePullRequests,
+    project?.repositoryIdentity,
+  );
+  // Everything that reads reference or the project runs before the query hook; a plain
+  // call on either after it would leave reference, and the detail atom it keys, uncached.
+  // The snapshot is already checked against reference, so live detail just wins below.
+  const cachedDetail =
+    reference && environmentId
+      ? readPullRequestDetailSnapshot(
+          typeof window === "undefined" ? undefined : window.localStorage,
+          environmentId,
+          reference,
+        )
+      : null;
+  const fallbackUrl = reference
+    ? (requestedReference?.url ??
+      gitHubPullRequestBrowserUrl(
+        project?.repositoryIdentity,
+        reference.repository,
+        reference.number,
+      ))
+    : undefined;
   const detail = useEnvironmentQuery(
     reference && environmentId
       ? pullRequestEnvironment.detail({
           environmentId,
-          input: {
-            projectId: ProjectId.make(reference.projectId),
-            ...(supportsMultiplePullRequests && reference.host !== undefined
-              ? { host: reference.host }
-              : {}),
-            repository: reference.repository,
-            number: reference.number,
-          },
+          input: reference,
         })
       : null,
   ).data;
-  const cachedDetail = useMemo(
-    () =>
-      reference && environmentId
-        ? readPullRequestDetailSnapshot(
-            typeof window === "undefined" ? undefined : window.localStorage,
-            environmentId,
-            reference,
-          )
-        : null,
-    [environmentId, reference],
-  );
-  return reference
-    ? (resolveDisplayedPullRequestDetail({ live: detail, cached: cachedDetail, reference })?.url ??
-        reference.url ??
-        gitHubPullRequestBrowserUrl(
-          project?.repositoryIdentity,
-          reference.repository,
-          reference.number,
-        ))
-    : undefined;
+  return reference ? ((detail ?? cachedDetail)?.url ?? fallbackUrl) : undefined;
 }

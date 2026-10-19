@@ -1,8 +1,11 @@
 import { ExternalLinkIcon, PaperclipIcon } from "lucide-react";
-import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
-import { createContext, useContext, useMemo } from "react";
+import { markdownImageSourceFragment } from "@t3tools/client-runtime/markdown-images";
+import { githubMediaFetchUrl } from "@t3tools/shared/githubMedia";
+import type { AssetResource, EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
+import { createContext, useContext } from "react";
 import type { Options as ReactMarkdownOptions } from "react-markdown";
 
+import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 import { cn } from "~/lib/utils";
 import { PULL_REQUESTS_PANEL_REF } from "~/rightPanelStore";
 
@@ -15,7 +18,34 @@ export const PullRequestMarkdownContext = createContext<{
   threadRef: ScopedThreadRef | null;
 } | null>(null);
 
-/** Renders PR uploads inline, with retry and an original link when video playback fails. */
+function PullRequestGitHubVideo({
+  environmentId,
+  cwd,
+  url,
+  fetchUrl,
+}: {
+  environmentId: EnvironmentId;
+  cwd: string;
+  url: string;
+  fetchUrl: string;
+}) {
+  const resource: AssetResource = { _tag: "github-media", cwd, url: fetchUrl };
+  const assetUrl = useAssetUrlState(environmentId, resource);
+  const refreshAssetUrl = useAssetUrlRefresh(environmentId, resource);
+  const src =
+    assetUrl._tag === "Success" ? assetUrl.url : assetUrl._tag === "Failure" ? fetchUrl : null;
+  return (
+    <MediaVideoPlayer
+      src={src === null ? null : src + markdownImageSourceFragment(url)}
+      originalUrl={url}
+      label="Pull request video"
+      className="w-full"
+      videoClassName="rounded-lg border border-border/60"
+      onRetry={refreshAssetUrl}
+    />
+  );
+}
+
 export function PullRequestMarkdown({
   text,
   cwd,
@@ -26,7 +56,6 @@ export function PullRequestMarkdown({
   text: string;
   cwd: string;
   environmentId: EnvironmentId;
-  /** Thread the body is shown beside, so its links can open in that thread's in-app browser. */
   threadRef?: ScopedThreadRef | null;
   className?: string;
 }) {
@@ -34,10 +63,9 @@ export function PullRequestMarkdown({
   const context = useContext(PullRequestMarkdownContext);
   const repositoryUrl = context?.repositoryUrl;
   const resolvedThreadRef = threadRef ?? context?.threadRef ?? undefined;
-  const extraRemarkPlugins = useMemo<NonNullable<ReactMarkdownOptions["remarkPlugins"]>>(
-    () => (repositoryUrl ? [[remarkPullRequestAutolinks, { repositoryUrl }]] : []),
-    [repositoryUrl],
-  );
+  const extraRemarkPlugins: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = repositoryUrl
+    ? [[remarkPullRequestAutolinks, { repositoryUrl }]]
+    : [];
   return (
     <div
       className={cn(
@@ -47,16 +75,29 @@ export function PullRequestMarkdown({
       data-image-gallery
     >
       {segments.map((segment) => {
-        if (segment.kind === "markdown") {
+        if (segment.kind === "markdown" || segment.media === "image") {
           return (
             <ChatMarkdown
               key={segment.id}
-              text={segment.text}
+              text={segment.kind === "markdown" ? segment.text : `![](<${segment.url}>)`}
               cwd={cwd}
               threadRef={resolvedThreadRef}
               pullRequestPanelRef={resolvedThreadRef ?? PULL_REQUESTS_PANEL_REF}
               environmentId={environmentId}
               extraRemarkPlugins={extraRemarkPlugins}
+              githubMedia
+            />
+          );
+        }
+        const githubMediaUrl = segment.media === "video" ? githubMediaFetchUrl(segment.url) : null;
+        if (githubMediaUrl !== null) {
+          return (
+            <PullRequestGitHubVideo
+              key={`${segment.id}:${segment.url}`}
+              environmentId={environmentId}
+              cwd={cwd}
+              url={segment.url}
+              fetchUrl={githubMediaUrl}
             />
           );
         }

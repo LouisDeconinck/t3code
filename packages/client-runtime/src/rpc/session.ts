@@ -18,13 +18,13 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
-import type * as Rpc from "effect/unstable/rpc/Rpc";
-import * as RpcClient from "effect/unstable/rpc/RpcClient";
-import * as RpcClientError from "effect/unstable/rpc/RpcClientError";
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
-import * as Socket from "effect/unstable/socket/Socket";
+import type * as Rpc from "effect/rpc/Rpc";
+import * as RpcClient from "effect/rpc/RpcClient";
+import * as RpcClientError from "effect/rpc/RpcClientError";
+import * as RpcSerialization from "effect/rpc/RpcSerialization";
+import * as Socket from "effect/socket/Socket";
 
-import { makeWsRpcProtocolClient, type WsRpcProtocolClient } from "./protocol.ts";
+import { makeWsRpcProtocolClient, PING_TIMEOUT, type WsRpcProtocolClient } from "./protocol.ts";
 import { NETWORK_BLOCKING_HINT } from "../errors/network.ts";
 import type {
   ConnectionAttemptError,
@@ -40,6 +40,7 @@ import {
   type ServerConfigProjection,
   withoutEnvironmentThemes,
 } from "../state/serverConfigProjection.ts";
+import { environmentMismatchError } from "../connection/errors.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
@@ -57,7 +58,6 @@ export interface RpcSession {
 export interface RpcSessionOptions {
   readonly environmentThemes?: boolean;
   readonly usageLimitSources?: boolean;
-  /** This client answers /usage-limits itself, so the server may advertise it. */
   readonly usageLimitsCommand?: boolean;
 }
 
@@ -169,18 +169,21 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
 
     const connected = yield* Deferred.make<void>();
     const disconnected = yield* Deferred.make<never, ConnectionTransientError>();
+    const pingTimedOut = yield* Ref.make(false);
     const hooks = RpcClient.ConnectionHooks.of({
       onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
-      onDisconnect: Deferred.isDone(connected).pipe(
-        Effect.flatMap((wasConnected) =>
+      onDisconnect: Effect.all([Deferred.isDone(connected), Ref.get(pingTimedOut)]).pipe(
+        Effect.flatMap(([wasConnected, timedOut]) =>
           Deferred.fail(
             disconnected,
             new ConnectionTransientErrorClass({
               reason: "transport",
               detail: `${
-                wasConnected
-                  ? `${connection.label} disconnected.`
-                  : `${connection.label} could not establish a WebSocket connection.`
+                !wasConnected
+                  ? `${connection.label} could not establish a WebSocket connection.`
+                  : timedOut
+                    ? `${connection.label} stopped responding.`
+                    : `${connection.label} disconnected.`
               }${networkHint}`,
             }),
           ),
@@ -188,25 +191,27 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
         Effect.asVoid,
       ),
     });
-    const socketLayer = Socket.layerWebSocket(connection.socketUrl, {
+    const layerSocket = Socket.layerWebSocket(connection.socketUrl, {
       openTimeout: SOCKET_OPEN_TIMEOUT,
     }).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor)));
-    const protocolLayer = Layer.effect(
+    const layerProtocol = Layer.effect(
       RpcClient.Protocol,
       RpcClient.makeProtocolSocket({
+        pingTimeout: PING_TIMEOUT,
         retryTransientErrors: false,
         retryPolicy: Schedule.recurs(0),
+        onPingTimeout: Ref.set(pingTimedOut, true),
       }),
     ).pipe(
       Layer.provide(
         Layer.mergeAll(
-          socketLayer,
+          layerSocket,
           RpcSerialization.layerJson,
           Layer.succeed(RpcClient.ConnectionHooks, hooks),
         ),
       ),
     );
-    const protocolContext = yield* Layer.build(protocolLayer).pipe(
+    const protocolContext = yield* Layer.build(layerProtocol).pipe(
       Effect.withSpan("environment.websocket.connect"),
     );
     const protocolClient = yield* makeWsRpcProtocolClient.pipe(Effect.provide(protocolContext));
@@ -289,14 +294,20 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
         Effect.mapError(mapRpcError),
         Effect.flatMap(() => Effect.fail(configSubscriptionEndedError)),
       ),
-    ).pipe(Effect.withSpan("environment.initialSync"));
+    ).pipe(
+      Effect.filterOrElse(
+        (config) => config.environment.environmentId === connection.environmentId,
+        (config) =>
+          environmentMismatchError({
+            expected: connection.environmentId,
+            actual: config.environment.environmentId,
+          }),
+      ),
+      Effect.withSpan("environment.initialSync"),
+    );
     const serverConfigEvents = Stream.unwrap(
       Effect.gen(function* () {
         const subscription = yield* PubSub.subscribe(serverConfigUpdates);
-        yield* Effect.raceFirst(
-          Deferred.await(initialConfigDeferred).pipe(Effect.asVoid),
-          Deferred.await(serverConfigExit),
-        );
         const snapshot = yield* Ref.get(serverConfigState);
         if (Option.isNone(snapshot)) {
           return Stream.empty;
@@ -336,10 +347,27 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
         );
       }),
     );
+    const validatedInitialConfig = initialConfig.pipe(
+      Effect.mapError(
+        (cause) =>
+          new RpcClientError.RpcClientError({
+            reason: new RpcClientError.RpcClientDefect({
+              message: `${connection.label} config subscription failed.`,
+              cause,
+            }),
+          }),
+      ),
+    );
     const subscribeServerConfig = (input: ServerConfigSubscriptionInput) =>
-      Equal.equals(input, serverConfigInput)
-        ? serverConfigEvents
-        : protocolClient[WS_METHODS.subscribeServerConfig](input);
+      Stream.unwrap(
+        validatedInitialConfig.pipe(
+          Effect.as(
+            Equal.equals(input, serverConfigInput)
+              ? serverConfigEvents
+              : protocolClient[WS_METHODS.subscribeServerConfig](input),
+          ),
+        ),
+      );
     const probe = initialConfig.pipe(
       Effect.flatMap((config) =>
         (config.environment.capabilities.connectionProbe === true
@@ -371,5 +399,4 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
   return RpcSessionFactory.of({ connect });
 });
 
-export const layerWithOptions = (options: RpcSessionOptions) =>
-  Layer.effect(RpcSessionFactory, make(options));
+export const layer = (options: RpcSessionOptions) => Layer.effect(RpcSessionFactory, make(options));

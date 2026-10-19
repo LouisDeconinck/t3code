@@ -1,5 +1,6 @@
 import {
   CommandId,
+  ComposerContextId,
   EnvironmentId,
   MessageId,
   ProjectId,
@@ -66,7 +67,6 @@ describe("resolvePendingThreadCreation", () => {
     });
     expect(previous).toBe(pending);
 
-    // The user message arrives before the provider publishes a timed turn.
     previous = resolvePendingThreadCreation({
       threadKey,
       pending,
@@ -75,8 +75,6 @@ describe("resolvePendingThreadCreation", () => {
     });
     expect(previous).toBe(pending);
 
-    // The shell stream may observe the turn and collect the global outcome
-    // before this screen's detail stream catches up.
     previous = resolvePendingThreadCreation({
       threadKey,
       pending: null,
@@ -168,8 +166,8 @@ describe("pendingThreadCreationShell", () => {
       interactionMode: "default",
       branch: "main",
       worktreePath: null,
-      latestTurn: null,
-      session: null,
+      latestRun: null,
+      runtime: null,
       latestUserMessageAt: creation.createdAt,
     });
   });
@@ -202,10 +200,6 @@ describe("isPendingThreadCreationVisible", () => {
     );
   });
 
-  // The regression: the server creates the thread, THEN builds the worktree,
-  // then starts the turn. The shell and an empty detail arrive seconds before
-  // the prompt, and keying on the shell left the thread empty for that whole
-  // window.
   it("keeps standing in while the created thread has no messages yet", () => {
     expect(isPendingThreadCreationVisible({ creationMessageId, loadedMessageIds: [] })).toBe(true);
   });
@@ -227,20 +221,32 @@ describe("isPendingThreadCreationVisible", () => {
 });
 
 describe("pendingThreadCreationMessage", () => {
+  it("keeps inline context available while the thread is being created", () => {
+    const record = {
+      version: 1 as const,
+      kind: "mention" as const,
+      contextId: ComposerContextId.make("setup-file"),
+      label: "Checkout.tsx",
+      path: "src/Checkout.tsx",
+    };
+    const context = { version: 1 as const, records: [record] };
+    const text = "[Checkout.tsx](t3-context://v1/mention/setup-file)";
+    const message = pendingThreadCreationMessage({ ...creation, text, context });
+    expect(message.text).toBe(text);
+    expect(message.context).toEqual(context);
+  });
+
   it("renders the queued prompt as the first user message", () => {
     expect(pendingThreadCreationMessage(creation)).toEqual({
       id: creation.messageId,
       role: "user",
       text: creation.text,
-      turnId: null,
       streaming: false,
       createdAt: creation.createdAt,
       updatedAt: creation.createdAt,
     });
   });
 
-  // Draft attachment ids are local; the feed resolves attachment rows against
-  // the server and would spin forever on them.
   it("omits the queued attachments rather than passing local draft ids to the feed", () => {
     expect(pendingThreadCreationMessage(creation)).not.toHaveProperty("attachments");
   });

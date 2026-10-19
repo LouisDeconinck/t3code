@@ -1,5 +1,5 @@
-import { WS_METHODS } from "@t3tools/contracts";
-import { Atom } from "effect/unstable/reactivity";
+import { type DeviceToolVersions, WS_METHODS } from "@t3tools/contracts";
+import { Atom } from "effect/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import {
@@ -17,7 +17,6 @@ export function createDeviceEnvironmentAtoms<R, E>(
     key: ({ environmentId }: { environmentId: string }) => environmentId,
   };
   return {
-    /** Server-pushed device hosts, devices, and open sessions for one environment. */
     state: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:device:state",
       tag: WS_METHODS.subscribeDeviceState,
@@ -70,3 +69,29 @@ export function createDeviceEnvironmentAtoms<R, E>(
     }),
   };
 }
+
+export function deviceToolVersionLabels(tools: DeviceToolVersions | undefined) {
+  if (!tools) return ["Device tool versions have not been checked."];
+  return (
+    [
+      ["Device hub", tools.hub],
+      ["Agent tools", tools.agent],
+    ] as const
+  ).map(([name, tool]) => {
+    const installed = tool.installedVersions.length ? tool.installedVersions.join(", ") : "none";
+    return `${name}: installed ${installed}; required ${tool.requiredVersion}${tool.runningVersion ? `; running ${tool.runningVersion}` : ""}.`;
+  });
+}
+
+export function deviceToolUpdatePolicy(tools: DeviceToolVersions | undefined) {
+  if (!tools) return "Versions have not been checked. Reconnect the host and check versions.";
+  const outdated = [tools.hub, tools.agent].filter(
+    (tool) =>
+      tool.installedVersions.length > 0 && !tool.installedVersions.includes(tool.requiredVersion),
+  );
+  return outdated.length > 0
+    ? "Update pending. Required tools will install automatically when next used. The host needs network access; an older install is not used as a fallback."
+    : "Required tools are installed automatically when needed. Checking versions does not install or start anything.";
+}
+export const deviceToolUpdateOwnership =
+  "This environment's T3 server chooses device tool versions for itself and its SSH hosts. Update that server to receive newer tool versions; updating only your browser or mobile app does not update a remote server.";
